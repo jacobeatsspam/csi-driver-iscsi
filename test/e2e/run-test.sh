@@ -26,6 +26,11 @@ LUN=1
 
 echo "=== iSCSI CSI Driver E2E Test ==="
 
+# Build and deliver the checkout before mutating Kubernetes resources.
+# shellcheck source=test/e2e/driver.sh
+source "$SCRIPT_DIR/driver.sh"
+prepare_driver
+
 # Step 0: Ensure open-iscsi is installed on all nodes
 echo "[0/7] Ensuring open-iscsi is installed on cluster nodes..."
 cat <<EOF | kubectl apply -f -
@@ -107,7 +112,7 @@ echo "iSCSI target connectivity check complete."
 
 # Step 3: Install CSI driver
 echo "[3/7] Installing iSCSI CSI driver..."
-"${REPO_ROOT}/deploy/install-driver.sh"
+install_driver
 echo "Waiting for CSI driver DaemonSet to be ready..."
 kubectl rollout status daemonset/csi-iscsi-node -n kube-system --timeout=120s
 echo "iSCSI CSI driver installed."
