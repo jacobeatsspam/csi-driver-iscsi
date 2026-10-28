@@ -1,0 +1,49 @@
+#!/bin/bash
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# driver.sh supplies the already validated delivery/cluster selection and shared
+# pushed_image_ref helper. Always build this checkout's target, never pull latest.
+prepare_target() {
+    case ${E2E_DRIVER_DELIVERY:-} in
+        kind) : "${E2E_KIND_CLUSTER:?Set E2E_KIND_CLUSTER for target delivery}" ;;
+        registry) ;;
+        *) echo 'Target delivery requires validated kind or registry mode' >&2; return 1 ;;
+    esac
+    if [[ ${E2E_DRIVER_DELIVERY:-kind} == registry && -z ${E2E_TARGET_IMAGE:-} ]]; then
+        echo 'Set E2E_TARGET_IMAGE to an explicit test-registry repository:tag' >&2; return 1
+    fi
+    E2E_TARGET_IMAGE=${E2E_TARGET_IMAGE:-iscsi-e2e-target:${DRIVER_SOURCE_REVISION:0:12}-$(date +%s)-$$}
+    if [[ "$E2E_TARGET_IMAGE" =~ [[:space:]] || "${E2E_TARGET_IMAGE##*/}" != *:* || "$E2E_TARGET_IMAGE" == *@* ||
+          ${E2E_TARGET_IMAGE##*:} == latest || ${E2E_TARGET_IMAGE##*:} == canary ]]; then
+        echo 'E2E_TARGET_IMAGE must have an explicit non-latest/non-canary tag' >&2; return 1
+    fi
+    docker build -t "$E2E_TARGET_IMAGE" "$REPO_ROOT/deploy/example/tgtd" || return
+    TARGET_LOCAL_ID=$(docker image inspect --format '{{.Id}}' "$E2E_TARGET_IMAGE") || return
+    if [[ ! "$TARGET_LOCAL_ID" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+        echo 'Cannot determine locally built target image ID' >&2; return 1
+    fi
+    if [[ "$E2E_DRIVER_DELIVERY" == kind ]]; then
+        kind load docker-image "$E2E_TARGET_IMAGE" --name "$E2E_KIND_CLUSTER" || return
+        TARGET_PULL_POLICY=Never
+        TARGET_EXPECTED_ID=$TARGET_LOCAL_ID
+    else
+        docker push "$E2E_TARGET_IMAGE" || return
+        E2E_TARGET_IMAGE=$(pushed_image_ref "$E2E_TARGET_IMAGE") || return
+        TARGET_PULL_POLICY=Always
+        TARGET_EXPECTED_ID=${E2E_TARGET_IMAGE##*@}
+    fi
+    export TARGET_PULL_POLICY TARGET_EXPECTED_ID
+    echo "Target image: $E2E_TARGET_IMAGE; local ID: $TARGET_LOCAL_ID"
+}

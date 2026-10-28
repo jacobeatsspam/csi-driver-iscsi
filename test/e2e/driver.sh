@@ -9,6 +9,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# shellcheck source=test/e2e/images.sh
+source "$REPO_ROOT/test/e2e/images.sh"
+
 # Local-build installation used by the e2e harness. Sourced, not executable.
 prepare_driver() {
     DRIVER_SOURCE_REVISION=$(git -C "$REPO_ROOT" rev-parse HEAD) || return
@@ -45,33 +48,7 @@ prepare_driver() {
         DRIVER_PULL_POLICY=Never
     else
         docker push "$E2E_DRIVER_IMAGE" || return
-        local repo_digests
-        repo_digests=$(docker image inspect --format '{{json .RepoDigests}}' "$E2E_DRIVER_IMAGE") || return
-        DRIVER_DIGEST_REF=$(python3 - "$E2E_DRIVER_IMAGE" "$repo_digests" <<'PY'
-import json, re, sys
-image, payload = sys.argv[1:]
-repository = image.rsplit(':', 1)[0]
-
-def canonical(repo):
-    parts = repo.split('/')
-    if len(parts) == 1 or not ('.' in parts[0] or ':' in parts[0] or parts[0] == 'localhost'):
-        parts.insert(0, 'docker.io')
-    if parts[0] == 'index.docker.io':
-        parts[0] = 'docker.io'
-    if parts[0] == 'docker.io' and len(parts) == 2:
-        parts.insert(1, 'library')
-    return '/'.join(parts)
-
-matches = set()
-for entry in json.loads(payload) or []:
-    repo, separator, digest = entry.rpartition('@')
-    if separator and canonical(repo) == canonical(repository) and re.fullmatch(r'sha256:[a-f0-9]{64}', digest):
-        matches.add(digest)
-if len(matches) != 1:
-    raise SystemExit('Cannot determine a unique pushed driver digest for ' + repository)
-print(repository + '@' + matches.pop())
-PY
-        ) || return
+        DRIVER_DIGEST_REF=$(pushed_image_ref "$E2E_DRIVER_IMAGE") || return
         E2E_DRIVER_IMAGE=$DRIVER_DIGEST_REF
         DRIVER_EXPECTED_ID=${DRIVER_DIGEST_REF##*@}
         DRIVER_PULL_POLICY=Always

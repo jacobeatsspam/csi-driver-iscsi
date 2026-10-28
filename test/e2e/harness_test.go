@@ -380,6 +380,10 @@ var _ = Describe("Harness", func() {
 			Expect(target).To(ContainSubstring(text))
 		}
 		Expect(target).NotTo(ContainSubstring("namespace: default"))
+		for _, text := range []string{"image: iscsi-target:test", "imagePullPolicy: Never", "command: [\"/ready.sh\"]", "mountPath: /var/lib/iscsi", "emptyDir: {}"} {
+			Expect(target).To(ContainSubstring(text))
+		}
+		Expect(target).NotTo(ContainSubstring(":latest"))
 		pv := hManifest(r.Calls, "kind: PersistentVolume\n")
 		for _, text := range []string{"targetPortal: \"10.244.0.17:3260\"", "discovery: \"true\"", "name: iscsi-pv-run123", "iscsi.csi.k8s.io/e2e-run: \"run123\""} {
 			Expect(pv).To(ContainSubstring(text))
@@ -615,7 +619,7 @@ var _ = Describe("Harness", func() {
 	})
 
 	It("requires one ready target pod with the expected image and a valid address", func() {
-		for _, failure := range []string{"target-unready", "target-multiple", "target-bad-ip"} {
+		for _, failure := range []string{"target-unready", "target-multiple", "target-bad-ip", "target-wrong-image"} {
 			By(failure)
 			r := runHarness(map[string]string{"FAILURE": failure})
 			Expect(r.Code).NotTo(Equal(0), r.Stderr)

@@ -161,3 +161,34 @@ under investigation in static CSI task S06; duplicate mount aliases are a
 hypothesis, not a confirmed diagnosis. This is a working regression detector,
 not a passing end-to-end acceptance result. Fixing the driver is separate work;
 do not weaken the cleanup assertions to make this baseline pass.
+
+## Locally built target fixture
+
+The harness builds `deploy/example/tgtd` from this checkout before creating
+cluster resources, loads it into the selected kind cluster or pushes it to the
+explicit test registry, and verifies the ready target pod's runtime image ID.
+`E2E_TARGET_IMAGE` selects an explicit non-latest/non-canary tag. Registry delivery
+requires it (for example `127.0.0.1:5000/iscsi-pr407-target:test`) and renders the
+matching immutable pushed digest, never a different repository's digest. Kind
+uses the loaded local image with `imagePullPolicy: Never`. The base image is
+pinned; the reported built image digest identifies the actual fixture tested.
+
+The target readiness probe queries live tgtadm configuration: the expected IQN,
+online LUN1, and backing-file path must all match. Startup fails if the daemon
+never becomes controllable, exits, or target configuration fails. The entrypoint
+bounds each control call (`TGTD_CONTROL_TIMEOUT`, default 3 seconds, plus a
+1-second forced-kill allowance) and terminates its own daemon on errors/signals
+with TERM followed by KILL after `TGTD_SHUTDOWN_TIMEOUT` (default 3 seconds); it does not leave a marker that can
+make a later failed daemon appear ready.
+
+A new backing file is sparsely initialized to `DISK_SIZE` MiB. An existing regular
+file of exactly that size is reused without truncation; mismatched sizes,
+symlinks and non-files fail instead of overwriting data. The deployment mounts
+`emptyDir` at `/var/lib/iscsi`, so bytes survive **container** restart in the same
+pod. Deleting/replacing the target pod or deleting the test namespace discards
+the scratch storage; it is not production persistence. Tests must not use real
+data as a fixture. The existing S06 teardown gate remains failing until fixed.
+
+For the standalone example, first build/load `iscsi-e2e-target:local` into your
+disposable cluster; its default pull policy deliberately refuses a remote image
+fallback. The main harness builds and selects its own image automatically.

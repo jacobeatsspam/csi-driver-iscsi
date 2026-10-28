@@ -46,9 +46,19 @@ spec:
     spec:
       containers:
         - name: tgtd
-          image: andyzhangx/tgtd:latest
+          image: iscsi-e2e-target:local
+          imagePullPolicy: Never
           securityContext:
             privileged: true
+          readinessProbe:
+            exec:
+              command: ["/ready.sh"]
+            initialDelaySeconds: 1
+            periodSeconds: 2
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: target-data
+              mountPath: /var/lib/iscsi
           ports:
             - containerPort: 3260
           env:
@@ -56,3 +66,6 @@ spec:
               value: "1024"
             - name: IQN
               value: "iqn.2026-01.com.test:storage"
+      volumes:
+        - name: target-data
+          emptyDir: {}

@@ -14,41 +14,70 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -e
+set -euo pipefail
 
-DISK_SIZE=${DISK_SIZE:-1024}  # Size in MB, default 1GB
-IQN=${IQN:-"iqn.2026-01.com.test:storage"}
-DISK_PATH="/var/lib/iscsi/disk0.img"
+DISK_SIZE=${DISK_SIZE:-1024}  # MiB; initialize only a new, disposable backing file.
+IQN=${IQN:-iqn.2026-01.com.test:storage}
+DISK_PATH=${DISK_PATH:-/var/lib/iscsi/disk0.img}
+TGTD_STARTUP_ATTEMPTS=${TGTD_STARTUP_ATTEMPTS:-10}
+TGTD_STARTUP_INTERVAL=${TGTD_STARTUP_INTERVAL:-1}
+TGTD_CONTROL_TIMEOUT=${TGTD_CONTROL_TIMEOUT:-3}
+TGTD_SHUTDOWN_TIMEOUT=${TGTD_SHUTDOWN_TIMEOUT:-3}
+if [[ ! "$DISK_SIZE" =~ ^[1-9][0-9]{0,5}$ || ! "$TGTD_STARTUP_ATTEMPTS" =~ ^[1-9][0-9]{0,2}$ ||
+      ! "$TGTD_STARTUP_INTERVAL" =~ ^[0-9]{1,2}$ || ! "$TGTD_CONTROL_TIMEOUT" =~ ^[1-9][0-9]?$ ||
+      ! "$TGTD_SHUTDOWN_TIMEOUT" =~ ^[1-9][0-9]?$ || "$IQN" != iqn.* || "$IQN" =~ [[:space:]] ]]; then
+    echo 'Invalid target size, IQN or startup bounds' >&2; exit 2
+fi
+expected_size=$((DISK_SIZE * 1024 * 1024))
+if [[ -L "$DISK_PATH" || ( -e "$DISK_PATH" && ! -f "$DISK_PATH" ) ]]; then
+    echo 'Backing path must be a regular non-symlink file' >&2; exit 1
+fi
+if [[ -e "$DISK_PATH" ]]; then
+    if [[ $(stat -c %s "$DISK_PATH") != "$expected_size" ]]; then
+        echo 'Existing backing file size differs; refusing to overwrite data' >&2; exit 1
+    fi
+else
+    mkdir -p "$(dirname "$DISK_PATH")"
+    # Noclobber also rejects a concurrently created file instead of erasing it.
+    (set -C; : > "$DISK_PATH")
+    truncate -s "$expected_size" "$DISK_PATH"
+fi
 
-mkdir -p /var/lib/iscsi
+TGTD_PID=
+cleanup() {
+    local result=$1 deadline=$((SECONDS + TGTD_SHUTDOWN_TIMEOUT))
+    if [[ -n "$TGTD_PID" ]]; then
+        kill -TERM "$TGTD_PID" 2>/dev/null || true
+        while kill -0 "$TGTD_PID" 2>/dev/null && ((SECONDS < deadline)); do sleep 0.1; done
+        if kill -0 "$TGTD_PID" 2>/dev/null; then kill -KILL "$TGTD_PID" 2>/dev/null || true; fi
+        wait "$TGTD_PID" 2>/dev/null || true
+    fi
+    return "$result"
+}
+trap 'cleanup "$?"' EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
-echo "Creating ${DISK_SIZE}MB disk image at ${DISK_PATH}..."
-dd if=/dev/zero of="$DISK_PATH" bs=1M count="$DISK_SIZE"
+control() {
+    timeout --foreground --kill-after=1s "${TGTD_CONTROL_TIMEOUT}s" tgtadm --lld iscsi "$@"
+}
 
-echo "Starting tgtd..."
 tgtd -f &
 TGTD_PID=$!
-
-# Wait for tgtd to be ready
-for i in $(seq 1 10); do
-    if tgtadm --lld iscsi --op show --mode sys > /dev/null 2>&1; then
-        break
-    fi
-    echo "Waiting for tgtd to start... ($i/10)"
-    sleep 1
+ready=0
+for ((attempt=0; attempt<TGTD_STARTUP_ATTEMPTS; attempt++)); do
+    kill -0 "$TGTD_PID" 2>/dev/null || { echo 'tgtd exited before startup' >&2; exit 1; }
+    if control --op show --mode sys >/dev/null 2>&1; then ready=1; break; fi
+    sleep "$TGTD_STARTUP_INTERVAL"
 done
+if [[ "$ready" != 1 ]]; then echo 'Timed out waiting for tgtd control readiness' >&2; exit 1; fi
 
-echo "Configuring iSCSI target..."
-tgtadm --lld iscsi --op new --mode target --tid 1 -T "$IQN"
-tgtadm --lld iscsi --op new --mode logicalunit --tid 1 --lun 1 -b "$DISK_PATH"
-tgtadm --lld iscsi --op bind --mode target --tid 1 -I ALL
+kill -0 "$TGTD_PID" 2>/dev/null || { echo 'tgtd exited before configuration' >&2; exit 1; }
 
-echo "========================================="
-echo "iSCSI target ready:"
-echo "  IQN:  $IQN"
-echo "  LUN:  1"
-echo "  Disk: $DISK_PATH (${DISK_SIZE}MB)"
-echo "========================================="
-tgtadm --lld iscsi --op show --mode target
-
-wait $TGTD_PID
+control --op new --mode target --tid 1 -T "$IQN"
+control --op new --mode logicalunit --tid 1 --lun 1 -b "$DISK_PATH"
+control --op bind --mode target --tid 1 -I ALL
+"$(dirname "${BASH_SOURCE[0]}")/ready.sh"
+kill -0 "$TGTD_PID" 2>/dev/null || { echo 'tgtd exited during configuration' >&2; exit 1; }
+echo 'iSCSI target configured and ready'
+wait "$TGTD_PID"

@@ -105,6 +105,9 @@ for resource in "namespace,pv,csidriver -l $OWNER_LABEL=$E2E_RUN_ID" "daemonset,
     fi
 done
 prepare_driver
+# shellcheck source=test/e2e/target.sh
+source "$SCRIPT_DIR/target.sh"
+prepare_target
 # Label rendered local driver objects so cleanup can select only this run.
 python3 - "$DRIVER_MANIFEST_DIR" "$E2E_RUN_ID" "$CLEANUP_TOKEN" <<'LABELS'
 import pathlib, sys
@@ -206,12 +209,15 @@ STAGE=target-rollout
 # Step 1: Deploy iSCSI target server
 echo "[1/7] Deploying iSCSI target server..."
 TARGET_MANIFEST=$(mktemp)
-python3 - "$REPO_ROOT/deploy/example/iscsi-server.yaml" "$TARGET_MANIFEST" "$TARGET_NAME" "$NAMESPACE" "$E2E_RUN_ID" "$IQN" "$CLEANUP_TOKEN" <<'TARGET'
+python3 - "$REPO_ROOT/deploy/example/iscsi-server.yaml" "$TARGET_MANIFEST" "$TARGET_NAME" "$NAMESPACE" "$E2E_RUN_ID" "$IQN" "$CLEANUP_TOKEN" "$E2E_TARGET_IMAGE" "$TARGET_PULL_POLICY" <<'TARGET'
 import pathlib, re, sys
-source, output, name, namespace, run_id, iqn, token = sys.argv[1:]
+source, output, name, namespace, run_id, iqn, token, image, policy = sys.argv[1:]
 text = pathlib.Path(source).read_text().replace('name: iscsi-server', 'name: ' + name).replace('app: iscsi-server', 'app: ' + name)
 text = text.replace('name: ' + name + '\n', 'name: ' + name + '\n  namespace: ' + namespace + '\n')
 text = text.replace('iqn.2026-01.com.test:storage', iqn)
+if text.count('image: iscsi-e2e-target:local') != 1:
+    raise SystemExit('Target manifest changed; update e2e renderer')
+text = text.replace('image: iscsi-e2e-target:local', 'image: ' + image).replace('imagePullPolicy: Never', 'imagePullPolicy: ' + policy)
 text = re.sub(r'(?m)^  labels:\n', '  labels:\n    iscsi.csi.k8s.io/e2e-run: "' + run_id + '"\n    iscsi.csi.k8s.io/e2e-invocation: "' + token + '"\n', text)
 pathlib.Path(output).write_text(text)
 TARGET
@@ -221,17 +227,27 @@ echo "iSCSI target server is ready."
 target_pods=$(kubectl get pods -n "$NAMESPACE" -l "app=$TARGET_NAME" -o json)
 # tgtd advertises its PodIP during SendTargets discovery. Using the ServiceIP
 # here creates a different node record from the one login/device lookup uses.
-TARGET_HOST=$(python3 - "$target_pods" <<'ADDRESS'
-import ipaddress, json, sys
-pods = [pod for pod in json.loads(sys.argv[1]).get('items', [])
+TARGET_HOST=$(python3 - "$target_pods" "$E2E_TARGET_IMAGE" "$TARGET_EXPECTED_ID" "$E2E_DRIVER_DELIVERY" <<'ADDRESS'
+import ipaddress, json, subprocess, sys
+payload, image, expected, delivery = sys.argv[1:]
+pods = [pod for pod in json.loads(payload).get('items', [])
         if not pod.get('metadata', {}).get('deletionTimestamp')]
 if len(pods) != 1:
     raise SystemExit('Expected exactly one ready target pod')
 pod = pods[0]
 ready = any(condition.get('type') == 'Ready' and condition.get('status') == 'True'
             for condition in pod.get('status', {}).get('conditions', []))
-if not ready:
-    raise SystemExit('Target pod is not ready')
+container = next((c for c in pod.get('spec', {}).get('containers', []) if c['name'] == 'tgtd'), {})
+status = next((c for c in pod.get('status', {}).get('containerStatuses', []) if c['name'] == 'tgtd'), {})
+runtime_id = status.get('imageID', '')
+actual = runtime_id.rsplit('@', 1)[-1].split('://')[-1]
+if actual != expected and delivery == 'kind' and runtime_id:
+    node = pod.get('spec', {}).get('nodeName', '')
+    if node:
+        inspection = subprocess.check_output(['docker', 'exec', node, 'crictl', 'inspecti', '-o', 'json', runtime_id], text=True)
+        actual = json.loads(inspection)['status']['id']
+if not ready or not status.get('ready') or container.get('image') != image or actual != expected:
+    raise SystemExit('Target pod is not ready with the selected built image')
 print(ipaddress.ip_address(pod['status']['podIP']))
 ADDRESS
 )

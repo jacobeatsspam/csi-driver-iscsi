@@ -169,7 +169,7 @@ var _ = Describe("Local driver installation", func() {
 	DescribeTable("rejects missing or ambiguous matching registry digests", func(digests []string) {
 		result, calls := runDriver(driverOptions{delivery: "registry", repoDigests: digests})
 		Expect(result.Code).NotTo(Equal(0))
-		Expect(result.Stderr).To(ContainSubstring("unique pushed driver digest"))
+		Expect(result.Stderr).To(ContainSubstring("unique pushed image digest"))
 		Expect(hasCall(calls, "kubectl")).To(BeFalse())
 	}, Entry("empty list", []string{}), Entry("foreign repository", []string{"other.example/foreign@" + driverDigest}), Entry("ambiguous digest", []string{"registry.example/iscsi@" + driverDigest, "registry.example/iscsi@sha256:" + strings.Repeat("d", 64)}))
 	DescribeTable("stops build or delivery failures before cluster mutation", func(failure string) {
