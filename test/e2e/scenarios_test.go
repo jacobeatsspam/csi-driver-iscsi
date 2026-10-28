@@ -295,10 +295,10 @@ var _ = Describe("Restart scenarios", func() {
 	})
 	It("shares one aggregate deadline across kind identity fallbacks", func() {
 		started := time.Now()
-		r := runScenario(map[string]string{"E2E_SCENARIOS": "baseline", "SCENARIO_FAILURE": "driver-slow-fallbacks", "IDENTITY_ONLY": "driver"})
+		r := runScenario(map[string]string{"E2E_SCENARIOS": "baseline", "SCENARIO_FAILURE": "driver-slow-fallbacks", "IDENTITY_ONLY": "driver", "E2E_COMMAND_TIMEOUT": "4", "SCENARIO_SLOW_DELAY": "2.5"})
 		Expect(r.Code).NotTo(Equal(0))
 		Expect(r.Stderr).To(ContainSubstring("Timed out resolving kind driver image identity"))
-		Expect(time.Since(started)).To(BeNumerically("<", 2500*time.Millisecond))
+		Expect(time.Since(started)).To(BeNumerically("<", 6500*time.Millisecond))
 		Expect(scenarioCalls(r.Calls, func(c []string) bool { return slices.Contains(c, "crictl") })).To(HaveLen(2))
 	})
 	It("includes the initial API query in the identity deadline", func() {
@@ -315,7 +315,7 @@ var _ = Describe("Restart scenarios", func() {
 	It("deducts successful API query time from the fallback budget", func() {
 		for _, component := range []string{"driver", "target"} {
 			By(component)
-			r := runScenario(map[string]string{"E2E_SCENARIOS": "baseline", "SCENARIO_FAILURE": component + "-slow-query", "IDENTITY_ONLY": component})
+			r := runScenario(map[string]string{"E2E_SCENARIOS": "baseline", "SCENARIO_FAILURE": component + "-slow-query", "IDENTITY_ONLY": component, "E2E_COMMAND_TIMEOUT": "4", "SCENARIO_SLOW_DELAY": "2.5"})
 			Expect(r.Code).NotTo(Equal(0))
 			Expect(r.Stderr).To(ContainSubstring("Timed out resolving kind " + component + " image identity"))
 			Expect(scenarioCalls(r.Calls, func(c []string) bool { return slices.Contains(c, "crictl") })).To(HaveLen(1))

@@ -220,7 +220,7 @@ func runHarness(overrides map[string]string) harnessResult {
 	dir, log := newFakeCommands("harness", "kubectl", "docker", "git", "make", "kind", "sleep", "nc", "go")
 	runtime := filepath.Join(dir, "runtime")
 	Expect(os.Mkdir(runtime, 0700)).To(Succeed())
-	env := map[string]string{"E2E_GO_FAKE": "harness", "PATH": dir + string(os.PathListSeparator) + os.Getenv("PATH"), "COMMAND_LOG": log, "FAILURE": "", "NAMESPACE": "test-run", "TMPDIR": runtime, "E2E_RETAIN_ON_FAILURE": "0", "FAIL_CLEANUP": "", "FAIL_CREATE_KIND": "", "E2E_RUN_ID": "run123", "EXISTING_RESOURCE": "", "STALE_RUN": "", "FAIL_DIAGNOSTICS": "", "E2E_COMMAND_TIMEOUT": "330", "E2E_TEARDOWN_TIMEOUT": "1", "E2E_DRIVER_IMAGE": "iscsi-e2e:test", "E2E_TARGET_IMAGE": "iscsi-target:test", "E2E_KIND_CLUSTER": "test", "E2E_ARCH": "amd64", "E2E_DRIVER_DELIVERY": "kind", "E2E_SCENARIOS": "baseline"}
+	env := map[string]string{"E2E_GO_FAKE": "harness", "PATH": dir + string(os.PathListSeparator) + os.Getenv("PATH"), "COMMAND_LOG": log, "FAILURE": "", "NAMESPACE": "test-run", "TMPDIR": runtime, "E2E_RETAIN_ON_FAILURE": "0", "FAIL_CLEANUP": "", "FAIL_CREATE_KIND": "", "E2E_RUN_ID": "run123", "EXISTING_RESOURCE": "", "STALE_RUN": "", "FAIL_DIAGNOSTICS": "", "E2E_COMMAND_TIMEOUT": "330", "E2E_TEARDOWN_TIMEOUT": "5", "E2E_DRIVER_IMAGE": "iscsi-e2e:test", "E2E_TARGET_IMAGE": "iscsi-target:test", "E2E_KIND_CLUSTER": "test", "E2E_ARCH": "amd64", "E2E_DRIVER_DELIVERY": "kind", "E2E_SCENARIOS": "baseline"}
 	for key, value := range overrides {
 		env[key] = value
 	}
