@@ -44,13 +44,15 @@ validate_scenarios() {
     if [[ "$E2E_SCENARIOS" == all ]]; then
         E2E_SCENARIOS=republish,driver-restart,target-restart
     fi
+    export TARGET_LUN_COUNT=1
     local scenario
     IFS=, read -r -a SELECTED_SCENARIOS <<< "$E2E_SCENARIOS"
     [[ -n "$E2E_SCENARIOS" && "$E2E_SCENARIOS" != *, ]] || { echo 'E2E_SCENARIOS must not be empty' >&2; return 2; }
     for scenario in "${SELECTED_SCENARIOS[@]}"; do
-        case "$scenario" in baseline|republish|driver-restart|target-restart) ;;
+        case "$scenario" in baseline|republish|driver-restart|target-restart|shared-target) ;;
             *) echo "Unsupported E2E_SCENARIOS entry: $scenario" >&2; return 2 ;;
         esac
+        if [[ "$scenario" == shared-target ]]; then TARGET_LUN_COUNT=2; fi
     done
 }
 
@@ -66,7 +68,11 @@ verify_payload() {
 # All scenario API calls are bounded by the remaining scenario budget in
 # addition to the ordinary request/stream timeout configured by run-test.sh.
 scenario_kubectl() {
-    local remaining=$((SCENARIO_DEADLINE - SECONDS))
+    local deadline=$SCENARIO_DEADLINE
+    if [[ -n ${SCENARIO_OPERATION_DEADLINE:-} ]] && ((SCENARIO_OPERATION_DEADLINE < deadline)); then
+        deadline=$SCENARIO_OPERATION_DEADLINE
+    fi
+    local remaining=$((deadline - SECONDS))
     if ((remaining <= 0)); then echo "Scenario $STAGE timed out" >&2; return 124; fi
     E2E_COMMAND_TIMEOUT=$remaining E2E_REQUEST_TIMEOUT=$remaining kubectl "$@"
 }
@@ -169,6 +175,7 @@ run_scenarios() {
             republish) republish_scenario || return ;;
             driver-restart) driver_restart_scenario || return ;;
             target-restart) target_restart_scenario || return ;;
+            shared-target) shared_target_scenario || return ;;
         esac
         local remaining=$((SCENARIO_DEADLINE - SECONDS))
         ((remaining > 0)) || return 124
@@ -176,3 +183,6 @@ run_scenarios() {
         echo "Scenario $scenario data check passed; overall teardown pending"
     done
 }
+
+# shellcheck source=test/e2e/shared-target.sh
+source "${BASH_SOURCE[0]%/*}/shared-target.sh"

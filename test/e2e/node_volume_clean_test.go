@@ -39,7 +39,7 @@ var _ = Describe("Node volume cleanup observations", func() {
 		writeFile(filepath.Join(root, "proc/self/mountinfo"), "", 0644)
 	})
 	check := func(mode, tracked, volume, lun string) commandResult {
-		return runCommandTimeout(10*time.Second, nil, "sh", filepath.Join(repoRoot, "test/e2e/node-volume-clean.sh"), mode, cleanupIQN, volume, tracked, root)
+		return runCommandTimeout(10*time.Second, nil, "sh", filepath.Join(repoRoot, "test/e2e/node-volume-clean.sh"), mode, cleanupIQN, volume, tracked, root, lun)
 	}
 	session := func(name, iqn, device string) string {
 		directory := filepath.Join(root, "sys/class/iscsi_session", name)
@@ -60,7 +60,9 @@ var _ = Describe("Node volume cleanup observations", func() {
 		mount := "1 0 8:0 / /var/lib/kubelet/pods/uid/volumes/kubernetes.io~csi/iscsi-pv-run123/mount rw - ext4 /dev/sdb rw\n"
 		writeFile(filepath.Join(root, "proc/1/mountinfo"), mount, 0644)
 		Expect(check("check", "", "iscsi-pv-run123", "").Code).To(Equal(1))
+		Expect(check("published", "", "iscsi-pv-run123", "").Code).To(Equal(0))
 		writeFile(filepath.Join(root, "proc/1/mountinfo"), "", 0644)
+		Expect(check("published", "", "iscsi-pv-run123", "").Code).To(Equal(2))
 		writeFile(filepath.Join(root, "proc/self/mountinfo"), mount, 0644)
 		Expect(check("check", "", "iscsi-pv-run123", "").Code).To(Equal(0))
 	})
@@ -84,6 +86,25 @@ var _ = Describe("Node volume cleanup observations", func() {
 		Expect(check("check", captured, "iscsi-pv-run123", "").Code).To(Equal(1))
 		Expect(os.Remove(filepath.Join(root, "sys/class/block/sdb"))).To(Succeed())
 		Expect(check("check", captured, "iscsi-pv-run123", "").Code).To(Equal(0))
+	})
+	It("allows another LUN and its shared session to remain", func() {
+		directory := session("session1", cleanupIQN, "sdb")
+		Expect(os.MkdirAll(filepath.Join(directory, "device/target1:0:0/1:0:0:2/block/sdc"), 0755)).To(Succeed())
+		Expect(os.Mkdir(filepath.Join(root, "sys/class/block/sdc"), 0755)).To(Succeed())
+		Expect(strings.TrimSpace(check("snapshot-lun", "", "iscsi-pv-run123", "1").Stdout)).To(Equal("sdb"))
+		Expect(strings.TrimSpace(check("snapshot-lun", "", "iscsi-pv-run123", "2").Stdout)).To(Equal("sdc"))
+		Expect(os.Symlink("/dev/sdc", filepath.Join(root, "dev/disk/by-path/ip-10.0.0.1-iscsi-"+cleanupIQN+"-lun-2"))).To(Succeed())
+		Expect(check("check-lun", "sdb", "iscsi-pv-run123", "1").Code).To(Equal(1))
+		Expect(os.Remove(filepath.Join(root, "sys/class/block/sdb"))).To(Succeed())
+		Expect(check("check-lun", "sdb", "iscsi-pv-run123", "1").Code).To(Equal(0))
+		Expect(filepath.Join(directory, "targetname")).To(BeAnExistingFile())
+		Expect(filepath.Join(root, "sys/class/block/sdc")).To(BeADirectory())
+		Expect(check("check-lun", "", "iscsi-pv-run123", "bad").Code).To(Equal(2))
+	})
+	It("does not hide another publication's mount after device removal", func() {
+		writeFile(filepath.Join(root, "proc/1/mountinfo"), "1 0 8:1 / /var/lib/kubelet/pods/uid/volumes/kubernetes.io~csi/iscsi-pv-b/mount rw - ext4 /dev/sdc rw\n", 0644)
+		Expect(check("check", "", "iscsi-pv-run123", "").Code).To(Equal(0))
+		Expect(check("check", "", "iscsi-pv-b", "").Code).To(Equal(1))
 	})
 	It("reports unsafe device names and unobservable mount state as errors", func() {
 		Expect(check("check", "../../etc", "iscsi-pv-run123", "").Code).To(Equal(2))

@@ -124,6 +124,13 @@ func fakeTgtdCommand(args []string) int {
 		} else {
 			fmt.Printf("Target 1: %s\n    LUN: 0\n        Online: Yes\n        Backing store path: None\n    LUN: %s\n        Online: %s\n        Backing store path: %s\n", iqn, lun, online, path)
 		}
+		if os.Getenv("LUN_COUNT") == "2" && issue != "missing-second" {
+			online = "Yes"
+			if issue == "second-offline" {
+				online = "No"
+			}
+			fmt.Printf("    LUN: 2\n        Online: %s\n        Backing store path: %s\n", online, os.Getenv("DISK_PATH_B"))
+		}
 	}
 	return 0
 }
@@ -281,6 +288,35 @@ var _ = Describe("Target fixture startup and readiness", func() {
 			Expect(readTgtdFile(env["DISK_PATH"])).To(Equal(before))
 			expectTgtdStopped(env["STATE"])
 		}
+	})
+	It("requires both LUNs online and preserves both backing files", func() {
+		env := tgtdFixture(map[string]string{"LUN_COUNT": "2"})
+		before := map[string][]byte{}
+		for _, key := range []string{"DISK_PATH", "DISK_PATH_B"} {
+			before[key] = seedTgtdBacking(env[key], []byte(env[key]))
+		}
+		code, out, configured := runTgtdEntrypoint(env)
+		Expect(configured).To(BeTrue(), out)
+		Expect(code).To(Equal(143), out)
+		for _, key := range []string{"DISK_PATH", "DISK_PATH_B"} {
+			Expect(readTgtdFile(env[key])).To(Equal(before[key]))
+		}
+		commands := readCalls(filepath.Join(env["STATE"], "commands"))
+		found := false
+		for _, call := range commands {
+			for index, value := range call {
+				if value == "--lun" && index+1 < len(call) && call[index+1] == "2" {
+					found = true
+				}
+			}
+		}
+		Expect(found).To(BeTrue())
+		for _, issue := range []string{"missing-second", "second-offline"} {
+			env["PROBE_ISSUE"] = issue
+			result := runCommand(env, "bash", filepath.Join(repoRoot, "deploy/example/tgtd/ready.sh"))
+			Expect(result.Code).NotTo(Equal(0), issue)
+		}
+		expectTgtdStopped(env["STATE"])
 	})
 	DescribeTable("refuses invalid backing paths or sizes without overwriting", func(issue string) {
 		env := tgtdFixture(nil)

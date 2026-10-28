@@ -33,6 +33,10 @@ TARGET_NAME=iscsi-target-$E2E_RUN_ID
 PV_NAME=iscsi-pv-$E2E_RUN_ID
 PVC_NAME=iscsi-pvc-$E2E_RUN_ID
 POD_NAME=iscsi-pod-$E2E_RUN_ID
+PV_B_NAME=iscsi-pv-b-$E2E_RUN_ID
+PVC_B_NAME=iscsi-pvc-b-$E2E_RUN_ID
+POD_B_NAME=iscsi-pod-b-$E2E_RUN_ID
+declare -a TEARDOWN_VOLUMES=("$PV_NAME")
 INIT_NAME=iscsi-init-$E2E_RUN_ID
 CONNECTIVITY_POD_NAME=iscsi-check-$E2E_RUN_ID
 OWNER_LABEL=iscsi.csi.k8s.io/e2e-run
@@ -59,7 +63,8 @@ E2E_COMMAND_TIMEOUT=${E2E_COMMAND_TIMEOUT:-330}
 E2E_REQUEST_TIMEOUT=${E2E_REQUEST_TIMEOUT:-30}
 E2E_TEARDOWN_TIMEOUT=${E2E_TEARDOWN_TIMEOUT:-60}
 E2E_SCENARIO_TIMEOUT=${E2E_SCENARIO_TIMEOUT:-180}
-for duration in "$E2E_COMMAND_TIMEOUT" "$E2E_REQUEST_TIMEOUT" "$E2E_TEARDOWN_TIMEOUT" "$E2E_SCENARIO_TIMEOUT"; do
+E2E_SHARED_IO_TIMEOUT=${E2E_SHARED_IO_TIMEOUT:-10}
+for duration in "$E2E_COMMAND_TIMEOUT" "$E2E_REQUEST_TIMEOUT" "$E2E_TEARDOWN_TIMEOUT" "$E2E_SCENARIO_TIMEOUT" "$E2E_SHARED_IO_TIMEOUT"; do
     if [[ ! "$duration" =~ ^[1-9][0-9]*$ ]]; then
         echo 'E2E timeouts must be positive integer seconds' >&2
         exit 2
@@ -102,7 +107,7 @@ source "$SCRIPT_DIR/driver.sh"
 # paths. Refuse to replace an existing installation, even in another namespace.
 # Cleanup uses ownership selectors for cluster-wide resources and driver
 # objects. A caller-supplied run ID must not adopt remnants of an earlier run.
-for resource in "namespace,pv,csidriver -l $OWNER_LABEL=$E2E_RUN_ID" "daemonset,configmap -n kube-system -l $OWNER_LABEL=$E2E_RUN_ID" "csidriver/iscsi.csi.k8s.io" "daemonset/csi-iscsi-node -n kube-system" "daemonsets.apps -A -l app=csi-iscsi-node" "configmap/configmap-csi-iscsiadm -n kube-system" "namespace/$NAMESPACE" "pv/$PV_NAME"; do
+for resource in "namespace,pv,csidriver -l $OWNER_LABEL=$E2E_RUN_ID" "daemonset,configmap -n kube-system -l $OWNER_LABEL=$E2E_RUN_ID" "csidriver/iscsi.csi.k8s.io" "daemonset/csi-iscsi-node -n kube-system" "daemonsets.apps -A -l app=csi-iscsi-node" "configmap/configmap-csi-iscsiadm -n kube-system" "namespace/$NAMESPACE" "pv/$PV_NAME" "pv/$PV_B_NAME"; do
     read -r -a resource_args <<< "$resource"
     existing=$(kubectl get "${resource_args[@]}" --ignore-not-found -o name)
     if [[ -n "$existing" ]]; then
@@ -214,12 +219,13 @@ STAGE=target-rollout
 # Step 1: Deploy iSCSI target server
 echo "[1/7] Deploying iSCSI target server..."
 TARGET_MANIFEST=$(mktemp)
-python3 - "$REPO_ROOT/deploy/example/iscsi-server.yaml" "$TARGET_MANIFEST" "$TARGET_NAME" "$NAMESPACE" "$E2E_RUN_ID" "$IQN" "$CLEANUP_TOKEN" "$E2E_TARGET_IMAGE" "$TARGET_PULL_POLICY" <<'TARGET'
+python3 - "$REPO_ROOT/deploy/example/iscsi-server.yaml" "$TARGET_MANIFEST" "$TARGET_NAME" "$NAMESPACE" "$E2E_RUN_ID" "$IQN" "$CLEANUP_TOKEN" "$E2E_TARGET_IMAGE" "$TARGET_PULL_POLICY" "$TARGET_LUN_COUNT" <<'TARGET'
 import pathlib, re, sys
-source, output, name, namespace, run_id, iqn, token, image, policy = sys.argv[1:]
+source, output, name, namespace, run_id, iqn, token, image, policy, lun_count = sys.argv[1:]
 text = pathlib.Path(source).read_text().replace('name: iscsi-server', 'name: ' + name).replace('app: iscsi-server', 'app: ' + name)
 text = text.replace('name: ' + name + '\n', 'name: ' + name + '\n  namespace: ' + namespace + '\n')
 text = text.replace('iqn.2026-01.com.test:storage', iqn)
+text = text.replace('name: LUN_COUNT\n              value: \"1\"', 'name: LUN_COUNT\n              value: \"' + lun_count + '\"')
 if text.count('image: iscsi-e2e-target:local') != 1:
     raise SystemExit('Target manifest changed; update e2e renderer')
 text = text.replace('image: iscsi-e2e-target:local', 'image: ' + image).replace('imagePullPolicy: Never', 'imagePullPolicy: ' + policy)
@@ -300,7 +306,7 @@ spec:
 EOF
 echo "PVC created."
 
-STAGE=pod-create
+STAGE="pod-create"
 # Step 6: Create test pod
 echo "[6/7] Creating test pod..."
 # Arm before create: an API timeout can occur after the pod was accepted.

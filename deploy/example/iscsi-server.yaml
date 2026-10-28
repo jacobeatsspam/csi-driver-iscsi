@@ -64,6 +64,8 @@ spec:
           env:
             - name: DISK_SIZE
               value: "1024"
+            - name: LUN_COUNT
+              value: "1"
             - name: IQN
               value: "iqn.2026-01.com.test:storage"
       volumes:

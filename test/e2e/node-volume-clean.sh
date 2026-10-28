@@ -12,11 +12,20 @@
 # Run in the node root with hostPID. /proc/1/mountinfo describes the node's mount
 # namespace; /proc/self/mountinfo would describe the validator container instead.
 set -eu
-mode=$1 iqn=$2 volume=$3 tracked=${4:-} node_root=${5:-/}
-case "$mode" in snapshot|check) ;; *) echo 'Invalid cleanup check mode' >&2; exit 2 ;; esac
+mode=$1 iqn=$2 volume=$3 tracked=${4:-} node_root=${5:-/} lun=${6:-}
+case "$mode" in snapshot|check|snapshot-lun|check-lun|published) ;; *) echo 'Invalid cleanup check mode' >&2; exit 2 ;; esac
+if [ "$mode" = snapshot-lun ] || [ "$mode" = check-lun ]; then
+    case "$lun" in ''|*[!0-9]*) echo 'Invalid LUN identifier' >&2; exit 2 ;; esac
+fi
 case "$volume" in ''|*[!a-zA-Z0-9_-]*) echo 'Invalid cleanup volume identifier' >&2; exit 2 ;; esac
 [ -r "$node_root/proc/1/mountinfo" ] || { echo 'Cannot observe node mount namespace' >&2; exit 2; }
 [ -d "$node_root/sys/class/block" ] || { echo 'Cannot observe node block devices' >&2; exit 2; }
+
+if [ "$mode" = published ]; then
+    if awk -v marker="/volumes/kubernetes.io~csi/$volume/" 'index($5, marker) { found=1 } END { exit !found }' "$node_root/proc/1/mountinfo"; then exit 0; fi
+    echo 'Expected A publication mount is not observable' >&2
+    exit 2
+fi
 
 residual=0
 for target in "$node_root"/sys/class/iscsi_session/session*/targetname; do
@@ -24,17 +33,21 @@ for target in "$node_root"/sys/class/iscsi_session/session*/targetname; do
     [ -r "$target" ] || { echo 'Cannot observe iSCSI session identity' >&2; exit 2; }
     IFS= read -r target_iqn < "$target"
     [ "$target_iqn" = "$iqn" ] || continue
-    if [ "$mode" = snapshot ]; then
+    if [ "$mode" = snapshot ] || [ "$mode" = snapshot-lun ]; then
         for block in "${target%/targetname}"/device/target*/*/block/*; do
             [ -e "$block" ] || continue
+            if [ "$mode" = snapshot-lun ]; then
+                address=${block%/block/*}; address=${address##*/}
+                [ "${address##*:}" = "$lun" ] || continue
+            fi
             basename "$block"
         done
-    else
+    elif [ "$mode" = check ]; then
         echo 'Run iSCSI session remains on node' >&2
         residual=1
     fi
 done
-[ "$mode" = check ] || exit 0
+[ "$mode" = check ] || [ "$mode" = check-lun ] || exit 0
 
 if awk -v marker="/volumes/kubernetes.io~csi/$volume/" 'index($5, marker) { found=1 } END { exit !found }' "$node_root/proc/1/mountinfo"; then
     echo 'Run publication mount remains in node mount namespace' >&2
@@ -44,6 +57,7 @@ else
     [ "$result" = 1 ] || { echo 'Cannot read node mount namespace' >&2; exit 2; }
 fi
 for path in "$node_root"/dev/disk/by-path/*-iscsi-"$iqn"-lun-*; do
+    if [ "$mode" = check-lun ] && [ "${path##*-lun-}" != "$lun" ]; then continue; fi
     if [ -e "$path" ] || [ -L "$path" ]; then
         echo 'Run iSCSI device path remains on node' >&2
         residual=1

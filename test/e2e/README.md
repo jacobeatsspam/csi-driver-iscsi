@@ -219,3 +219,29 @@ that transition's data check. Overall success still requires the final graceful
 node teardown gate. The observed S06 driver leak can therefore make the run fail
 after all scenario data checks pass; it is not converted to a skip or success.
 Failures report a scenario-specific stage without printing unexpected payloads.
+
+
+## Shared-target regression gate
+
+Select `E2E_SCENARIOS=shared-target` explicitly. `all` continues to select the
+restart scenarios; the shared-target gate is a separate, heavier regression
+case. The fixture exports LUN1 and LUN2 from distinct backing files under one
+IQN and requires both to be online before readiness. Both files are retained
+across container restarts in the same target pod.
+
+The scenario pins workload B to A's node, starts checked/fsynced B I/O, and
+requires two successful iterations before requesting A's graceful deletion. It
+keeps sampling B while A terminates. A worker restart, failure, reset progress
+or stalled progress fails; `E2E_SHARED_IO_TIMEOUT` (default 10 seconds) bounds
+I/O commands and progress gaps. A may pass removal only after its pod, node
+publication mount, LUN1 by-path and previously observed block devices disappear.
+B's LUN2 and shared session are allowed to remain. The scenario then republishes
+A without reseeding and verifies both payloads. Final cleanup checks **both**
+publication mount markers as well as the run's sessions and devices.
+
+The existing S06 leaked-device behavior can fail A's removal even while B I/O
+continues. That outcome is a failing safety gate, not proof that safe shared
+removal works; it can also mask the separate S07 target-wide logout defect.
+The harness does not change the driver or weaken these assertions. A failed
+run retains its fixture when requested, and failed verified final teardown
+always retains supporting resources for recovery.

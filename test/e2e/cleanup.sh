@@ -13,10 +13,13 @@
 # Snapshot device identities before deleting the publication, then wait for
 # unpublish to remove mounts, devices and the run-specific target session.
 verify_volume_teardown() {
-    local deadline=$((SECONDS + E2E_TEARDOWN_TIMEOUT)) remaining result validator
+    local deadline=$((SECONDS + E2E_TEARDOWN_TIMEOUT)) remaining result validator volume
     local node_check
     node_check=$(cat "$SCRIPT_DIR/node-volume-clean.sh") || return 1
+    local -a volumes=("$PV_NAME")
+    if declare -p TEARDOWN_VOLUMES &>/dev/null; then volumes=("${TEARDOWN_VOLUMES[@]}"); fi
     for validator in "${TEARDOWN_VALIDATORS[@]}"; do
+      for volume in "${volumes[@]}"; do
         while true; do
             remaining=$((deadline - SECONDS))
             if ((remaining <= 0)); then
@@ -24,7 +27,7 @@ verify_volume_teardown() {
                 return 1
             fi
             if E2E_COMMAND_TIMEOUT=$remaining E2E_REQUEST_TIMEOUT=$remaining kubectl exec "$validator" -n "$NAMESPACE" -- \
-                chroot /host /bin/sh -c "$node_check" volume-clean check "$IQN" "$PV_NAME" "${TEARDOWN_DEVICES[$validator]}"; then
+                chroot /host /bin/sh -c "$node_check" volume-clean check "$IQN" "$volume" "${TEARDOWN_DEVICES[$validator]}"; then
                 break
             else
                 result=$?
@@ -35,14 +38,15 @@ verify_volume_teardown() {
             fi
             sleep 1
         done
+      done
     done
 }
 
 snapshot_volume_devices() {
-    local validators node_check validator validator_status
+    local validators node_check validator validator_status query=${1:-kubectl}
     node_check=$(cat "$SCRIPT_DIR/node-volume-clean.sh") || return 1
-    validators=$(kubectl get pods -n "$NAMESPACE" -l "app=$INIT_NAME" -o json) || return 1
-    validator_status=$(kubectl get daemonset "$INIT_NAME" -n "$NAMESPACE" -o json) || return 1
+    validators=$("$query" get pods -n "$NAMESPACE" -l "app=$INIT_NAME" -o json) || return 1
+    validator_status=$("$query" get daemonset "$INIT_NAME" -n "$NAMESPACE" -o json) || return 1
     validators=$(python3 - "$validators" "$validator_status" <<'VALIDATORS'
 import json, sys
 pods = json.loads(sys.argv[1]).get('items', [])
@@ -59,7 +63,7 @@ VALIDATORS
     ) || return 1
     mapfile -t TEARDOWN_VALIDATORS <<< "$validators"
     for validator in "${TEARDOWN_VALIDATORS[@]}"; do
-        TEARDOWN_DEVICES[$validator]=$(kubectl exec "$validator" -n "$NAMESPACE" -- chroot /host /bin/sh -c \
+        TEARDOWN_DEVICES[$validator]=$("$query" exec "$validator" -n "$NAMESPACE" -- chroot /host /bin/sh -c \
             "$node_check" volume-clean snapshot "$IQN" "$PV_NAME") || return 1
     done
 }
@@ -72,7 +76,7 @@ cleanup_resources() {
         local selector="$OWNER_LABEL=$E2E_RUN_ID,$CLEANUP_LABEL=$CLEANUP_TOKEN"
         echo "Cleaning up invocation $CLEANUP_TOKEN in namespace $NAMESPACE..."
         if [[ ${VOLUME_MAY_BE_PUBLISHED:-0} == 1 ]]; then
-            if ! snapshot_volume_devices; then
+            if ! snapshot_volume_devices kubectl; then
                 echo 'Cannot snapshot node devices; retaining resources for safe recovery' >&2
                 return 1
             fi
