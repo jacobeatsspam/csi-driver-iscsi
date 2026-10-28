@@ -38,3 +38,18 @@ cd test/e2e && go test ./... -v
 The fake-command tests prove build/delivery failures propagate, local manifests
 select the built image and runtime digest mismatches fail. They do not establish
 that a real node can mount an iSCSI LUN; that remains an integration gate.
+
+The harness fails on an unreachable target, failed Kubernetes operations, readiness
+expiration, or unexpected payload. `E2E_COMMAND_TIMEOUT` (default 330 seconds)
+bounds each kubectl command, including streaming commands;
+`E2E_REQUEST_TIMEOUT` (default 30 seconds) bounds API requests. Both require GNU
+`timeout` and positive integer values. Failure diagnostics report the stage,
+original exit status, pod status and event reasons. They intentionally omit pod
+logs, event messages, manifests and unexpected payloads because these may expose
+credentials. Diagnostics failing does not replace the original failure status.
+
+For a separate negative connectivity integration check on a disposable cluster,
+source `test/e2e/checks.sh`, set `NAMESPACE`, and call
+`check_target_connectivity HOST PORT` under an outer timeout. The helper propagates
+the remote TCP check's nonzero status. Resource isolation and failure cleanup
+remain pending in the next tasks.
