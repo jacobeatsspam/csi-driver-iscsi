@@ -1,0 +1,94 @@
+---
+name: iSCSI harness tests
+
+on:
+  pull_request: {}
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: Native scenario selection (known S06 driver gate currently fails)
+        required: true
+        default: all
+        type: choice
+        options:
+          - baseline
+          - all
+          - shared-target
+
+permissions:
+  contents: read
+
+jobs:
+  harness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            test/e2e/go.sum
+      - name: Unprivileged command and failure-path tests
+        run: make e2e-unit
+      - name: Install validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck yamllint
+          GOBIN="$RUNNER_TEMP/tools" go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+      - name: Shell, manifest, workflow YAML and real license checks
+        run: make e2e-lint
+      - name: Real Docker target readiness and persistence
+        run: make e2e-fixture-test
+
+  native:
+    if: github.event_name == 'workflow_dispatch'
+    needs: harness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            test/e2e/go.sum
+      - name: Prepare this disposable hosted runner (not a shared cluster)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y open-iscsi
+          sudo modprobe iscsi_tcp
+          sudo systemctl start iscsid
+          sudo mkdir -p /etc/rancher/k3s
+          printf '%s\n' 'mirrors:' '  "127.0.0.1:5000":' '    endpoint: ["http://127.0.0.1:5000"]' |
+            sudo tee /etc/rancher/k3s/registries.yaml >/dev/null
+          docker run -d --name iscsi-e2e-registry -p 127.0.0.1:5000:5000 registry:2.8.3
+          curl --fail --silent --show-error --location https://get.k3s.io -o "$RUNNER_TEMP/install-k3s.sh"
+          sudo env INSTALL_K3S_VERSION=v1.32.10+k3s1 sh "$RUNNER_TEMP/install-k3s.sh" server --node-name iscsi-e2e-runner --disable traefik --disable servicelb
+          sudo install -m 600 -o "$(id -u)" /etc/rancher/k3s/k3s.yaml "$RUNNER_TEMP/iscsi-kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/iscsi-kubeconfig" >> "$GITHUB_ENV"
+      - name: Wait for native node
+        run: |
+          kubectl wait --for=create node/iscsi-e2e-runner --timeout=180s
+          kubectl wait --for=condition=Ready node/iscsi-e2e-runner --timeout=180s
+      - name: Run real native CSI test (failures stay failures)
+        env:
+          E2E_DRIVER_DELIVERY: registry
+          E2E_DRIVER_IMAGE: 127.0.0.1:5000/iscsi-driver:ci
+          E2E_TARGET_IMAGE: 127.0.0.1:5000/iscsi-target:ci
+          E2E_SCENARIOS: ${{ inputs.scenarios }}
+          E2E_ARTIFACT_DIR: ${{ runner.temp }}/iscsi-e2e-results
+          E2E_RECORD_TIMEOUT: '1200'
+        run: make e2e-record
+      - name: Upload whitelisted evidence, including failed-run status
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: iscsi-native-evidence
+          path: ${{ runner.temp }}/iscsi-e2e-results/summary.json
+          if-no-files-found: warn

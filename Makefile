@@ -72,3 +72,27 @@ uninstall-iscsi-server:
 .PHONY: e2e-test
 e2e-test:
 	bash test/e2e/run-test.sh
+
+ACTIONLINT ?= actionlint
+E2E_RECORD_TIMEOUT ?= 1800
+.PHONY: e2e-unit e2e-lint e2e-fixture-test e2e-record
+e2e-unit:
+	cd test/e2e && go test -mod=readonly -count=1 -v ./...
+
+e2e-lint:
+	@test -z "$$(gofmt -l test/e2e)" || (echo 'Run gofmt on test/e2e Go files' >&2; exit 1)
+	cd test/e2e && go vet -mod=readonly ./...
+	shellcheck -x test/e2e/*.sh deploy/example/tgtd/*.sh hack/verify-boilerplate.sh
+	bash hack/verify-boilerplate.sh
+	yamllint --strict -d '{extends: default, rules: {line-length: disable, truthy: disable}}' deploy/example/iscsi-server.yaml .github/workflows/iscsi-e2e.yaml
+	$(ACTIONLINT) .github/workflows/iscsi-e2e.yaml
+
+e2e-fixture-test:
+	cd test/e2e && go build -mod=readonly -o ../../bin/e2e-fixture-test ./cmd/fixture-integration
+	./bin/e2e-fixture-test
+
+# E2E_ARTIFACT_DIR must be a new directory; never overwrite another run's results.
+e2e-record:
+	@test -n "$(E2E_ARTIFACT_DIR)" || (echo 'Set E2E_ARTIFACT_DIR to a new results directory' >&2; exit 2)
+	cd test/e2e && go build -mod=readonly -o ../../bin/e2e-record ./cmd/record-run
+	./bin/e2e-record --artifacts "$(E2E_ARTIFACT_DIR)" --timeout "$(E2E_RECORD_TIMEOUT)"

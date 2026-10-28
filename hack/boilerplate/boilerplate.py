@@ -32,13 +32,12 @@ parser.add_argument(
     help="list of files to check, all files if unspecified",
     nargs='*')
 
-# Rootdir defaults to the directory **above** the repo-infra dir.
-rootdir = os.path.dirname(__file__) + "./../../../"
-rootdir = os.path.abspath(rootdir)
+# Resolve references from this repository, independently of the caller's cwd.
+rootdir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 parser.add_argument(
     "--rootdir", default=rootdir, help="root directory to examine")
 
-default_boilerplate_dir = os.path.join(rootdir, "csi-driver-nfs/hack/boilerplate")
+default_boilerplate_dir = os.path.join(rootdir, "hack/boilerplate")
 
 parser.add_argument(
     "--boilerplate-dir", default=default_boilerplate_dir)
@@ -190,6 +189,10 @@ def get_regexs():
 def main():
     regexs = get_regexs()
     refs = get_refs()
+    if not refs:
+        print("No boilerplate references found in %s" % args.boilerplate_dir,
+              file=sys.stderr)
+        return 1
     filenames = get_files(refs.keys())
 
     for filename in filenames:

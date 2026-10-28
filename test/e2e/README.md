@@ -4,9 +4,9 @@ Run only on a fresh disposable cluster with no existing installation of
 `iscsi.csi.k8s.io`. The harness refuses an existing CSIDriver, matching driver
 DaemonSet, or driver ConfigMap before build or mutation. It does not support
 adopting externally managed drivers: local-build verification is mandatory.
-The inherited harness still force-deletes workloads during cleanup; graceful
-teardown is tracked separately in the PR #407 review backlog. No complete
-mount/unmount live-cluster pass has been recorded yet.
+The harness verifies graceful teardown and retains the supporting resources if
+that verification fails. Native data checks have passed, but the current driver
+fails the final teardown gate; see [validation evidence](VALIDATION.md).
 
 The test builds the current checkout, including uncommitted changes, and installs
 the local driver manifests. It prints the source revision, built image ID and
@@ -40,7 +40,10 @@ Removing a kind cluster removes its container/service changes, but does not undo
 kernel modules loaded into the shared host kernel. A VM with a matching kernel
 and module loader avoids that container-specific preparation.
 
-For a disposable kind cluster:
+Kind delivery is available, but is not a proven initiator environment: the local
+kind test failed kernel-control communication during login even after node
+preparation. Use native Kubernetes in a disposable Linux VM for real iSCSI
+acceptance. To exercise kind delivery where the environment supports it:
 
 ```sh
 E2E_KIND_CLUSTER=iscsi-test make e2e-test
@@ -53,7 +56,9 @@ Never so an absent local image fails instead of falling back to a registry.
 For other disposable clusters, provide a writable registry accessible to nodes:
 
 ```sh
-E2E_DRIVER_DELIVERY=registry E2E_DRIVER_IMAGE=registry.example/test/iscsi:run-123 make e2e-test
+E2E_DRIVER_DELIVERY=registry \
+E2E_DRIVER_IMAGE=registry.example/test/iscsi:run-123 \
+E2E_TARGET_IMAGE=registry.example/test/tgtd:run-123 make e2e-test
 ```
 
 The image is built, pushed, and deployed by digest. Node registry credentials
@@ -63,7 +68,7 @@ select a compatible architecture explicitly for test nodes when necessary.
 Run unprivileged installation contract tests without a cluster:
 
 ```sh
-cd test/e2e && go test ./... -v
+cd test/e2e && go test -mod=readonly -count=1 -v ./...
 ```
 
 The fake-command tests prove build/delivery failures propagate, local manifests
@@ -279,3 +284,56 @@ baseline data check. It does not silently include gated features or the explicit
 shared-target regression. Remove a gate only when its implementation and real
 integration tests have passed, and update this matrix with the tested evidence.
 Keep the existing S06/S07 regression failures distinct from unsupported API gates.
+
+
+## Test commands and CI
+
+The Go tests and runners use a separate module in `test/e2e`; their dependencies
+are pinned in its `go.mod` and `go.sum`. The driver module and vendor tree are
+unchanged. No Ginkgo CLI installation is required. Command doubles re-execute
+the Go test binary. Python 3 is still used by the shell harness helpers and
+the existing repository boilerplate checker.
+
+Run `make e2e-unit` for unprivileged Ginkgo/Gomega command/failure tests.
+Run `make e2e-lint` for Go formatting/vet, ShellCheck, YAML and real repository
+license-header validation. Neither
+requires a target or cluster. `make e2e-fixture-test` builds this checkout's
+target and uses uniquely labeled Docker containers/volumes to test live protocol
+readiness, backing-byte preservation across restart, incompatible-file rejection
+and cleanup. It needs Docker access, not an iSCSI initiator. Its nonzero result
+is a failure, never a skipped pass.
+
+For native integration on an already prepared disposable cluster, set both
+registry image variables as above and run:
+
+```sh
+E2E_ARTIFACT_DIR=/tmp/new-iscsi-results E2E_SCENARIOS=all make e2e-record
+```
+
+The artifact directory must be new. `bin/e2e-record` preserves the actual exit
+status and has a 1800-second whole-command limit (set `E2E_RECORD_TIMEOUT` for
+make, or `--timeout` when calling the recorder directly). The native CI job uses
+1200 seconds so its 30-minute job budget leaves setup and artifact-upload time.
+Its private, unlinked temporary raw output is discarded; the console and
+`summary.json` expose only exact data-phase markers, digest values, exit status,
+source revision and whitelisted node version fields. It never uploads raw logs,
+credentials, kubeconfig, manifests or event messages. A phase marker cannot turn
+a failing final status into success. Exit 78 remains a gate; exit 2 remains an
+input error. Use the direct harness and retained fixture for detailed debugging.
+`source_revision` is HEAD; `source_dirty` is true/false for any nonignored tracked
+or untracked worktree changes, or null when Git state cannot be determined.
+It stores no status paths or diff contents. A dirty record is not an exact
+clean-commit snapshot.
+Timeout or interruption terminates the entire owned process group, escalating
+TERM to KILL even if its leader already exited. A normally successful leader
+that leaves background test processes also fails after group cleanup; the
+summary distinguishes its `command_exit_code` from the final `exit_code`.
+
+The `iSCSI harness tests` workflow runs unit, lint and real Docker fixture tests
+on pull requests. Its manually dispatched native job prepares only a fresh
+GitHub-hosted Ubuntu runner, runs pinned k3s with the registry delivery path, and
+uploads `summary.json` even on failure. It does not run against an existing
+cluster. There is no `continue-on-error`; the known S06 defect currently makes
+the native job fail. Local workflow validation is not evidence that GitHub ran
+the job. See [recorded validation](VALIDATION.md) for the actual environments
+and limitations.
