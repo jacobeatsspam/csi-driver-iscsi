@@ -4,8 +4,8 @@ Run only on a fresh disposable cluster with no existing installation of
 `iscsi.csi.k8s.io`. The harness refuses an existing CSIDriver, matching driver
 DaemonSet, or driver ConfigMap before build or mutation. It does not support
 adopting externally managed drivers: local-build verification is mandatory.
-The inherited harness still changes host packages and has incomplete failure
-cleanup; those are tracked separately in the PR #407 review backlog. No complete
+The inherited harness still changes host packages and force-deletes workloads
+during cleanup; those are tracked separately in the PR #407 review backlog. No complete
 mount/unmount live-cluster pass has been recorded yet.
 
 The test builds the current checkout, including uncommitted changes, and installs
@@ -55,7 +55,24 @@ credentials. Diagnostics failing does not replace the original failure status.
 For a separate negative connectivity integration check on a disposable cluster,
 source `test/e2e/checks.sh`, set `NAMESPACE`, and call
 `check_target_connectivity HOST PORT` under an outer timeout. The helper propagates
-the remote TCP check's nonzero status. Failure cleanup remains pending in the next task.
+the remote TCP check's nonzero status.
+
+An EXIT trap cleans partially created resources on normal completion, errors,
+INT (exit 130) and TERM (exit 143). Cleanup runs before a passing result is
+printed; a cleanup error makes an otherwise successful test fail, while an
+original test failure keeps its exit status. Local rendered manifests are
+removed too. Missing resources are ignored so cleanup can be repeated.
+
+Every invocation adds a fresh random `iscsi.csi.k8s.io/e2e-invocation` token in
+addition to the run ID. Cleanup requires both labels. This prevents a failed
+namespace-create race from deleting another invocation's resources even if the
+caller reused a run ID. Preflight refusals never arm cluster cleanup.
+
+For debugging only, set `E2E_RETAIN_ON_FAILURE=1` to retain failed-run resources
+and rendered manifests; the harness prints the namespace, run ID, invocation
+token and local manifest paths. Successful runs still clean up. Inspect and
+remove retained resources using **both** ownership labels; do not delete an
+unrelated namespace or driver installation. The default is cleanup on failure.
 
 Each run generates a random `E2E_RUN_ID` and a new `iscsi-e2e-RUN_ID` namespace.
 You can set `NAMESPACE` to a different **new** namespace and `E2E_RUN_ID` to a

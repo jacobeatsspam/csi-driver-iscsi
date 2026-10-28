@@ -357,7 +357,7 @@ var _ = Describe("Harness", func() {
 		}
 		for _, c := range r.Calls {
 			if hPrefix(c, "kubectl", "delete") {
-				Expect(c).To(ContainElement("iscsi.csi.k8s.io/e2e-run=run123"))
+				Expect(strings.Join(c, " ")).To(ContainSubstring("iscsi.csi.k8s.io/e2e-run=run123,"))
 			}
 			if hPrefix(c, "kubectl", "run") {
 				Expect(c).To(ContainElement("dedicated-tests"))
@@ -449,6 +449,99 @@ var _ = Describe("Harness", func() {
 		r := runCommand(map[string]string{"E2E_COMMAND_TIMEOUT": "0"}, "bash", filepath.Join(repoRoot, "test/e2e/run-test.sh"))
 		Expect(r.Code).To(Equal(2), r.Stderr)
 		Expect(r.Stderr).To(ContainSubstring("positive integer"))
+	})
+
+	It("cleans only owned resources after failure at each creation stage", func() {
+		for _, kind := range []string{"Namespace", "DaemonSet", "Service", "CSIDriver", "PersistentVolume", "PersistentVolumeClaim", "Pod"} {
+			By(kind)
+			r := runHarness(map[string]string{"FAIL_CREATE_KIND": kind})
+			Expect(r.Code).To(Equal(19), r.Stderr)
+			deletes := hMatches(r.Calls, func(c []string) bool { return hPrefix(c, "kubectl", "delete") })
+			Expect(deletes).NotTo(BeEmpty())
+			token := hToken(hManifest(r.Calls, "kind: Namespace\n"))
+			for _, c := range deletes {
+				Expect(c).To(ContainElement("iscsi.csi.k8s.io/e2e-run=run123,iscsi.csi.k8s.io/e2e-invocation=" + token))
+				Expect(c).To(ContainElement("--ignore-not-found"))
+			}
+			Expect(r.Artifacts).To(BeEmpty())
+		}
+	})
+
+	It("fails a successful run on cleanup failure and preserves earlier failures", func() {
+		for _, tc := range []struct {
+			failure string
+			code    int
+		}{{"", 1}, {"apply", 17}} {
+			By(tc.failure)
+			r := runHarness(map[string]string{"FAILURE": tc.failure, "FAIL_CLEANUP": "1"})
+			Expect(r.Code).To(Equal(tc.code), r.Stderr)
+			Expect(r.Stderr).To(ContainSubstring("E2E cleanup failed"))
+			Expect(r.Stdout).NotTo(ContainSubstring("E2E test PASSED"))
+			Expect(hasCall(r.Calls, "kubectl", "delete", "namespace")).To(BeTrue())
+			Expect(r.Artifacts).To(BeEmpty())
+		}
+	})
+
+	It("cannot clean another invocation after a competing namespace create fails", func() {
+		tokens := []string{}
+		selectors := [][]string{}
+		for range 2 {
+			r := runHarness(map[string]string{"FAIL_CREATE_KIND": "Namespace"})
+			Expect(r.Code).To(Equal(19), r.Stderr)
+			tokens = append(tokens, hToken(hManifest(r.Calls, "kind: Namespace\n")))
+			current := []string{}
+			for _, c := range r.Calls {
+				if hPrefix(c, "kubectl", "delete") {
+					index := slices.Index(c, "-l")
+					Expect(index).To(BeNumerically(">=", 0))
+					current = append(current, c[index+1])
+				}
+			}
+			selectors = append(selectors, current)
+		}
+		Expect(tokens[0]).NotTo(Equal(tokens[1]))
+		for i := range 2 {
+			for _, selector := range selectors[i] {
+				Expect(selector).To(ContainSubstring("e2e-invocation=" + tokens[i]))
+				Expect(selector).NotTo(ContainSubstring(tokens[1-i]))
+			}
+		}
+	})
+
+	It("retains failed runs when requested but cleans successful runs", func() {
+		r := runHarness(map[string]string{"FAILURE": "apply", "E2E_RETAIN_ON_FAILURE": "1"})
+		Expect(r.Code).To(Equal(17), r.Stderr)
+		Expect(r.Stderr).To(ContainSubstring("Retaining failed invocation"))
+		Expect(hasCall(r.Calls, "kubectl", "delete")).To(BeFalse())
+		Expect(r.Artifacts).NotTo(BeEmpty())
+		r = runHarness(map[string]string{"E2E_RETAIN_ON_FAILURE": "1"})
+		Expect(r.Code).To(Equal(0), r.Stderr)
+		Expect(hasCall(r.Calls, "kubectl", "delete")).To(BeTrue())
+		Expect(r.Artifacts).To(BeEmpty())
+	})
+
+	It("cleans owned resources on TERM and returns signal status", func() {
+		r := runHarness(map[string]string{"FAILURE": "signal"})
+		Expect(r.Code).To(Equal(143), r.Stderr)
+		Expect(hasCall(r.Calls, "kubectl", "delete", "namespace")).To(BeTrue())
+		Expect(r.Artifacts).To(BeEmpty())
+	})
+
+	It("makes cleanup idempotent and scopes it to the invocation", func() {
+		dir := GinkgoT().TempDir()
+		log := filepath.Join(dir, "commands")
+		writeFile(filepath.Join(dir, "kubectl"), "#!/bin/sh\nprintf \"%s\\n\" \"$*\" >> \"$COMMAND_LOG\"\n", 0755)
+		r := runCommand(map[string]string{"PATH": dir + string(os.PathListSeparator) + os.Getenv("PATH"), "COMMAND_LOG": log}, "bash", "-euo", "pipefail", "-c", "source test/e2e/cleanup.sh; CLEANUP_CLUSTER=1; NAMESPACE=owned; OWNER_LABEL=owner; E2E_RUN_ID=run; CLEANUP_LABEL=invocation; CLEANUP_TOKEN=unique; cleanup_resources; cleanup_resources")
+		Expect(r.Code).To(Equal(0), r.Stderr)
+		data, err := os.ReadFile(log)
+		Expect(err).NotTo(HaveOccurred())
+		calls := strings.Split(strings.TrimSpace(string(data)), "\n")
+		Expect(calls).To(HaveLen(16))
+		Expect(calls[:8]).To(Equal(calls[8:]))
+		for _, c := range calls {
+			Expect(c).To(ContainSubstring("-l owner=run,invocation=unique"))
+			Expect(c).To(ContainSubstring("--ignore-not-found"))
+		}
 	})
 
 })

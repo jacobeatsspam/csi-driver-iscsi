@@ -36,6 +36,17 @@ POD_NAME=iscsi-pod-$E2E_RUN_ID
 INIT_NAME=iscsi-init-$E2E_RUN_ID
 CONNECTIVITY_POD_NAME=iscsi-check-$E2E_RUN_ID
 OWNER_LABEL=iscsi.csi.k8s.io/e2e-run
+CLEANUP_LABEL=iscsi.csi.k8s.io/e2e-invocation
+# Never reuse an invocation token, even when the caller reuses a run ID. This
+# makes cleanup safe after failed/ambiguous creates and concurrent name races.
+CLEANUP_TOKEN=$(python3 -c 'import secrets; print(secrets.token_hex(12))')
+CLEANUP_CLUSTER=0
+TARGET_MANIFEST=
+DRIVER_MANIFEST_DIR=
+E2E_RETAIN_ON_FAILURE=${E2E_RETAIN_ON_FAILURE:-0}
+if [[ "$E2E_RETAIN_ON_FAILURE" != 0 && "$E2E_RETAIN_ON_FAILURE" != 1 ]]; then
+    echo 'E2E_RETAIN_ON_FAILURE must be 0 or 1' >&2; exit 2
+fi
 IQN=iqn.2026-01.com.test:storage-$E2E_RUN_ID
 LUN=1
 
@@ -67,6 +78,11 @@ failure_diagnostics() {
     exit "$result"
 }
 trap 'failure_diagnostics "$?"' ERR
+# shellcheck source=test/e2e/cleanup.sh
+source "$SCRIPT_DIR/cleanup.sh"
+trap 'finish_run "$?"' EXIT
+trap 'failure_diagnostics 130' INT
+trap 'failure_diagnostics 143' TERM
 
 echo "=== iSCSI CSI Driver E2E Test ==="
 
@@ -86,13 +102,14 @@ for resource in "namespace,pv,csidriver -l $OWNER_LABEL=$E2E_RUN_ID" "daemonset,
 done
 prepare_driver
 # Label rendered local driver objects so cleanup can select only this run.
-python3 - "$DRIVER_MANIFEST_DIR" "$E2E_RUN_ID" <<'LABELS'
+python3 - "$DRIVER_MANIFEST_DIR" "$E2E_RUN_ID" "$CLEANUP_TOKEN" <<'LABELS'
 import pathlib, sys
 for path in pathlib.Path(sys.argv[1]).glob('*.yaml'):
-    text = path.read_text().replace('\nmetadata:\n', '\nmetadata:\n  labels:\n    iscsi.csi.k8s.io/e2e-run: "' + sys.argv[2] + '"\n')
+    text = path.read_text().replace('\nmetadata:\n', '\nmetadata:\n  labels:\n    iscsi.csi.k8s.io/e2e-run: "' + sys.argv[2] + '"\n    iscsi.csi.k8s.io/e2e-invocation: "' + sys.argv[3] + '"\n')
     path.write_text(text)
 LABELS
 E2E_DRIVER_CREATE_ONLY=1
+CLEANUP_CLUSTER=1
 cat <<EOF | kubectl create -f -
 apiVersion: v1
 kind: Namespace
@@ -100,6 +117,7 @@ metadata:
   name: $NAMESPACE
   labels:
     $OWNER_LABEL: "$E2E_RUN_ID"
+    $CLEANUP_LABEL: "$CLEANUP_TOKEN"
 EOF
 
 STAGE=node-preparation
@@ -113,6 +131,7 @@ metadata:
   namespace: $NAMESPACE
   labels:
     $OWNER_LABEL: "$E2E_RUN_ID"
+    $CLEANUP_LABEL: "$CLEANUP_TOKEN"
 spec:
   selector:
     matchLabels:
@@ -176,13 +195,13 @@ STAGE=target-rollout
 # Step 1: Deploy iSCSI target server
 echo "[1/7] Deploying iSCSI target server..."
 TARGET_MANIFEST=$(mktemp)
-python3 - "$REPO_ROOT/deploy/example/iscsi-server.yaml" "$TARGET_MANIFEST" "$TARGET_NAME" "$NAMESPACE" "$E2E_RUN_ID" "$IQN" <<'TARGET'
+python3 - "$REPO_ROOT/deploy/example/iscsi-server.yaml" "$TARGET_MANIFEST" "$TARGET_NAME" "$NAMESPACE" "$E2E_RUN_ID" "$IQN" "$CLEANUP_TOKEN" <<'TARGET'
 import pathlib, re, sys
-source, output, name, namespace, run_id, iqn = sys.argv[1:]
+source, output, name, namespace, run_id, iqn, token = sys.argv[1:]
 text = pathlib.Path(source).read_text().replace('name: iscsi-server', 'name: ' + name).replace('app: iscsi-server', 'app: ' + name)
 text = text.replace('name: ' + name + '\n', 'name: ' + name + '\n  namespace: ' + namespace + '\n')
 text = text.replace('iqn.2026-01.com.test:storage', iqn)
-text = re.sub(r'(?m)^  labels:\n', '  labels:\n    iscsi.csi.k8s.io/e2e-run: "' + run_id + '"\n', text)
+text = re.sub(r'(?m)^  labels:\n', '  labels:\n    iscsi.csi.k8s.io/e2e-run: "' + run_id + '"\n    iscsi.csi.k8s.io/e2e-invocation: "' + token + '"\n', text)
 pathlib.Path(output).write_text(text)
 TARGET
 kubectl create -f "$TARGET_MANIFEST"
@@ -221,6 +240,7 @@ metadata:
   name: ${PV_NAME}
   labels:
     $OWNER_LABEL: "$E2E_RUN_ID"
+    $CLEANUP_LABEL: "$CLEANUP_TOKEN"
 spec:
   capacity:
     storage: 1Gi
@@ -250,6 +270,7 @@ metadata:
   namespace: ${NAMESPACE}
   labels:
     $OWNER_LABEL: "$E2E_RUN_ID"
+    $CLEANUP_LABEL: "$CLEANUP_TOKEN"
 spec:
   accessModes:
     - ReadWriteOnce
@@ -272,6 +293,7 @@ metadata:
   namespace: ${NAMESPACE}
   labels:
     $OWNER_LABEL: "$E2E_RUN_ID"
+    $CLEANUP_LABEL: "$CLEANUP_TOKEN"
 spec:
   containers:
     - name: test
@@ -295,23 +317,10 @@ STAGE=data-verification
 echo "[7/7] Verifying mount..."
 RESULT=$(kubectl exec "${POD_NAME}" -n "${NAMESPACE}" -- cat /mnt/test-file)
 if [ "$RESULT" = "iSCSI CSI test successful" ]; then
-  echo "✅ E2E test PASSED: iSCSI volume mounted and writable"
   EXIT_CODE=0
 else
   echo "E2E data verification failed: unexpected file contents" >&2
   failure_diagnostics 1
 fi
-
-# Cleanup
-echo "Cleaning up..."
-kubectl delete pods -n "${NAMESPACE}" -l "$OWNER_LABEL=$E2E_RUN_ID" --grace-period=0 --force 2>/dev/null || true
-kubectl delete pvc -n "${NAMESPACE}" -l "$OWNER_LABEL=$E2E_RUN_ID" 2>/dev/null || true
-kubectl delete pv -l "$OWNER_LABEL=$E2E_RUN_ID" 2>/dev/null || true
-kubectl delete deployment,service -n "$NAMESPACE" -l "$OWNER_LABEL=$E2E_RUN_ID" 2>/dev/null || true
-kubectl delete daemonset -n "$NAMESPACE" -l "$OWNER_LABEL=$E2E_RUN_ID" 2>/dev/null || true
-kubectl delete daemonset,configmap -n kube-system -l "$OWNER_LABEL=$E2E_RUN_ID" 2>/dev/null || true
-kubectl delete csidriver -l "$OWNER_LABEL=$E2E_RUN_ID" 2>/dev/null || true
-kubectl delete namespace -l "$OWNER_LABEL=$E2E_RUN_ID" 2>/dev/null || true
-rm -f "$TARGET_MANIFEST"
 
 exit $EXIT_CODE
