@@ -1,339 +1,182 @@
-# iSCSI e2e tests
+# iSCSI end-to-end tests
 
-Run only on a fresh disposable cluster with no existing installation of
-`iscsi.csi.k8s.io`. The harness refuses an existing CSIDriver, matching driver
-DaemonSet, or driver ConfigMap before build or mutation. It does not support
-adopting externally managed drivers: local-build verification is mandatory.
-The harness verifies graceful teardown and retains the supporting resources if
-that verification fails. Native data checks have passed, but the current driver
-fails the final teardown gate; see [validation evidence](VALIDATION.md).
+This is a Go Ginkgo v2/Gomega suite for pre-existing iSCSI LUNs. The suite,
+Kubernetes operations, node probes, data workers, target supervisor and result
+recorder are Go programs. Kubernetes resources are built as typed objects and
+managed through client-go. Image builds and delivery execute Go, Docker and
+kind directly, without a shell harness or Python programs.
 
-The test builds the current checkout, including uncommitted changes, and installs
-the local driver manifests. It prints the source revision, built image ID and
-each verified driver pod imageID; it never installs an upstream canary instead.
-Python 3, Go, make, Docker and kubectl are required.
+## Layout
 
-Prepare disposable test nodes **before** running the harness: Linux, open-iscsi
-(`iscsiadm`), an active `iscsid`, the kernel's iSCSI TCP transport, and a running
-udev daemon are required. The harness only validates these prerequisites. Its
-privileged validator mounts each node root read-only and runs the fixed checks
-through `chroot /host` with the node PID namespace; it does not install packages,
-load modules, enable services or start daemons. A failed check keeps the validator
-unready and fails the test before the target or driver is installed. Zero eligible
-nodes cannot produce a passing validation. On failure, the harness prints the
-validator's readiness events (before any test credentials or application pods
-exist), which identify the missing prerequisite.
+- `e2e_suite_test.go`, `static_provisioning_test.go`: real cluster specs and
+  suite lifecycle, enabled with the `e2e` build tag.
+- `driver/`: static PV, PVC and workload pod builders.
+- `testsuites/`: context-aware setup, scenarios, image verification hooks and
+  ownership-scoped cleanup using Kubernetes clients.
+- `images/`: checkout builds, kind/registry delivery and runtime image identity.
+- `probe/`, `workload/`, `cmd/e2e-tools/`: read-only node observations and data
+  operations in a purpose-built container.
+- `targetfixture/`, `cmd/tgtd-fixture/`: bounded tgtd supervision and readiness.
+- `internal/runner/`: Docker fixture checks and allowlisted result recording.
 
-Node preparation is a separate administrator operation, never automatic e2e
-behavior. For a disposable Debian/Ubuntu VM, install `open-iscsi` using its package
-manager, load `iscsi_tcp`, and start the node's `iscsid` and udev services using
-that system's service manager. Other Linux distributions use their own package
-and service names. These operations persist beyond test cleanup; use only a
-disposable VM/node and verify the correct host before performing them.
+All dependencies use the root `go.mod`, `go.sum` and vendor tree, matching the
+sibling CSI repos. No separate test module or installed Ginkgo CLI is required.
 
-For kind, the node container must have the initiator tools and active daemons,
-and shares the host kernel modules. Use a node image/module loader compatible
-with the host module compression. In our local environment the old kind image's
-kmod lacked Zstandard support, and udev's container condition prevented startup;
-those were resolved explicitly in the disposable node, outside the harness.
-Removing a kind cluster removes its container/service changes, but does not undo
-kernel modules loaded into the shared host kernel. A VM with a matching kernel
-and module loader avoids that container-specific preparation.
-
-Kind delivery is available, but is not a proven initiator environment: the local
-kind test failed kernel-control communication during login even after node
-preparation. Use native Kubernetes in a disposable Linux VM for real iSCSI
-acceptance. To exercise kind delivery where the environment supports it:
+## Local checks
 
 ```sh
-E2E_KIND_CLUSTER=iscsi-test make e2e-test
+make e2e-unit
+make e2e-lint
+golangci-lint run
+make e2e-fixture-test
 ```
 
-The harness builds a unique image tag and loads it into that kind cluster. Set
-kubectl's context to the same cluster before running. The driver uses pull policy
-Never so an absent local image fails instead of falling back to a registry.
+Unit tests use Kubernetes fake clients, temporary files and Go subprocess
+fixtures. They do not require a cluster and do not prove kernel integration.
+Lint checks Go formatting/vet, manifest/workflow YAML and repository license
+headers. Run the repository-wide `golangci-lint run` separately to match the
+Static Checks workflow (validated with v2.15.0). The existing repository license
+checker requires Python 3; it is separate from e2e execution. ShellCheck, yamllint and actionlint v1.7.12 are
+needed for lint (`ACTIONLINT=/path/to/actionlint` can override its executable).
 
-For other disposable clusters, provide a writable registry accessible to nodes:
+The Docker fixture check builds this checkout's target image, verifies actual
+tgtd protocol readiness, writes known backing bytes, restarts the container,
+checks those bytes, rejects an incompatible backing size and removes only its
+owned container and volume. It needs Docker access, not an initiator or cluster.
+
+## Cluster prerequisites
+
+Use a fresh disposable cluster with no installation of `iscsi.csi.k8s.io`.
+The suite refuses existing driver objects, reused namespaces and stale run
+resources. Do not use a production NAS or an existing shared installation.
+
+Prepare Linux nodes with open-iscsi (`iscsiadm`), a running iscsid, udev, and the
+iSCSI TCP kernel transport before running. Node preparation is an administrator
+operation; the suite does not install packages, load modules or start services.
+Its validator mounts the node root read-only and observes host PID1 mountinfo,
+processes, sysfs and device paths with a Go probe. Every node validator must be
+ready and its image verified before any volume test can pass.
+
+The local runner needs Go, make, Docker with the buildx plugin, and access to the disposable cluster.
+kind is additionally needed for kind delivery. Select the node architecture
+using `E2E_ARCH` when it differs from the runner (amd64 and arm64 are accepted).
+
+## Run against kind
+
+On already prepared disposable kind nodes:
 
 ```sh
-E2E_DRIVER_DELIVERY=registry \
-E2E_DRIVER_IMAGE=registry.example/test/iscsi:run-123 \
-E2E_TARGET_IMAGE=registry.example/test/tgtd:run-123 make e2e-test
+export KUBECONFIG=/path/to/disposable-kind-kubeconfig
+export E2E_DRIVER_DELIVERY=kind
+export E2E_KIND_CLUSTER=iscsi-e2e
+E2E_SCENARIOS=all make e2e-test
 ```
 
-The image is built, pushed, and deployed by digest. Node registry credentials
-must already be configured. E2E_ARCH defaults to the local Go architecture;
-select a compatible architecture explicitly for test nodes when necessary.
+The kubeconfig context must be `kind-iscsi-e2e`. The suite builds the driver,
+target and tools from this checkout and loads explicit run-specific tags into
+that cluster. Local image tags must not be latest, canary, untagged or digests.
+Every running driver, target and validator image is checked against its built
+config identity, recorded by Buildx metadata or a hash-verified OCI export
+when the exporter omits that field. Docker .Id is not assumed to be a config
+digest. kind runtime inspection resolves the actual running image ID, never a
+mutable desired tag as substitute evidence.
 
-Run unprivileged installation contract tests without a cluster:
+## Run with a registry
+
+For a prepared native disposable cluster, use a registry accessible to both
+Docker and every node runtime. Configure registry transport and credentials on
+those nodes separately.
 
 ```sh
-cd test/e2e && go test -mod=readonly -count=1 -v ./...
+export KUBECONFIG=/path/to/disposable-kubeconfig
+export E2E_DRIVER_DELIVERY=registry
+export E2E_DRIVER_IMAGE=registry.example/iscsi-driver:e2e
+export E2E_TARGET_IMAGE=registry.example/iscsi-target:e2e
+export E2E_TOOLS_IMAGE=registry.example/iscsi-tools:e2e
+E2E_SCENARIOS=all make e2e-test
 ```
 
-The fake-command tests prove build/delivery failures propagate, local manifests
-select the built image and runtime digest mismatches fail. They do not establish
-that a real node can mount an iSCSI LUN; that remains an integration gate.
+All three images are built and pushed, selected by the matching repository's
+immutable digest, and verified against ready runtime container identities.
+OCI indexes and cached aliases are resolved through exact immutable platform
+manifest descriptors to the checkout build config digest. A desired mutable
+tag is never accepted as evidence of the running image.
+The target uses persistent backing files in its pod's emptyDir, so container
+restart preserves its LUNs. Replacing the target pod or changing its IP fails
+the target-restart scenario. The actual ready target PodIP is the iSCSI portal;
+the service ClusterIP is not used for discovery/login identity.
 
-The harness fails on an unreachable target, failed Kubernetes operations, readiness
-expiration, or unexpected payload. `E2E_COMMAND_TIMEOUT` (default 330 seconds)
-bounds each kubectl command, including streaming commands;
-`E2E_REQUEST_TIMEOUT` (default 30 seconds) bounds API requests. Both require GNU
-`timeout` and positive integer values. Failure diagnostics report the stage,
-original exit status, pod status and event reasons. They intentionally omit pod
-logs, event messages, manifests and unexpected payloads because these may expose
-credentials. Diagnostics failing does not replace the original failure status.
+`make e2e-build` compiles `bin/iscsi-e2e.test`. `make e2e-test` executes that
+binary directly. Set `GINKGO_FLAGS` for verbosity or reports. Empty focus/skip
+selections fail, dry runs are rejected, and filtering away a requested scenario
+cannot establish a successful requested test run.
 
-For a separate negative connectivity integration check on a disposable cluster,
-source `test/e2e/checks.sh`, set `NAMESPACE`, and call
-`check_target_connectivity HOST PORT` under an outer timeout. The helper propagates
-the remote TCP check's nonzero status.
+## Scenarios and feature gates
 
-An EXIT trap cleans partially created resources on normal completion, errors,
-INT (exit 130) and TERM (exit 143). Cleanup runs before a passing result is
-printed; a cleanup error makes an otherwise successful test fail, while an
-original test failure keeps its exit status. Local rendered manifests are
-removed too. Missing resources are ignored so cleanup can be repeated.
+Baseline always mounts LUN1, seeds once with exclusive creation, fsyncs and
+verifies exact payload bytes. It is followed by the requested scenarios:
 
-Every invocation adds a fresh random `iscsi.csi.k8s.io/e2e-invocation` token in
-addition to the run ID. Cleanup requires both labels. This prevents a failed
-namespace-create race from deleting another invocation's resources even if the
-caller reused a run ID. Preflight refusals never arm cluster cleanup.
-
-For debugging only, set `E2E_RETAIN_ON_FAILURE=1` to retain failed-run resources
-and rendered manifests; the harness prints the namespace, run ID, invocation
-token and local manifest paths. Successful runs still clean up. Inspect and
-remove retained resources using **both** ownership labels; do not delete an
-unrelated namespace or driver installation. The default is cleanup on failure.
-
-Each run generates a random `E2E_RUN_ID` and a new `iscsi-e2e-RUN_ID` namespace.
-You can set `NAMESPACE` to a different **new** namespace and `E2E_RUN_ID` to a
-1–20 character lowercase alphanumeric/hyphen identifier. Existing namespaces and
-same-named PVs are rejected, including when their labels appear to match. A run
-ID with existing namespace/PV/CSIDriver or driver-resource ownership labels is
-also rejected, even when selecting a different namespace, so stale runs cannot
-be adopted or cleaned up by a new invocation. Test
-objects (including cluster-scoped PVs and installed driver objects) carry the
-`iscsi.csi.k8s.io/e2e-run` ownership label; cleanup selects only that run. Creation
-uses `kubectl create`, so a collision cannot silently overwrite resources.
-
-The target has a run-specific name, selector and IQN. The PV uses the single
-ready target pod's validated IP and enables discovery for a fresh initiator.
-The real baseline exposed that tgtd advertises its PodIP during discovery: using
-the ServiceIP creates a node record for a different portal than login/device
-lookup expects. PodIP also avoids depending on node-side cluster DNS. Driver registration
-and node host paths remain global: run full harnesses sequentially on a cluster,
-not concurrently. Separate clusters are required for parallel runs.
-
-Standalone example fixture targets also require an explicit namespace:
-
-```sh
-kubectl create namespace my-disposable-target
-make install-iscsi-server ISCSI_SERVER_NAMESPACE=my-disposable-target
-make uninstall-iscsi-server ISCSI_SERVER_NAMESPACE=my-disposable-target
-```
-
-Those commands use the example's names within that namespace and refuse to
-replace existing objects on installation. Uninstall selects only objects labeled
-as this example, not the run-specific e2e driver or resources.
-
-Static test PVs use `Retain`; deleting a Kubernetes object must not claim to
-delete backend storage. Cleanup deletes owned workload pods normally and waits
-for deletion. Before deletion, read-only validator commands snapshot block
-device names for this run's IQN. After deletion, validators inspect the node's
-`/proc/1/mountinfo`, run-specific iSCSI sessions/device paths, and captured block
-devices. They must all disappear before PVC/PV, target, validator and driver
-resources are removed. Unrelated IQNs and volumes are neither modified nor
-required to disappear.
-
-`E2E_TEARDOWN_TIMEOUT` defaults to 60 seconds and bounds the node teardown wait.
-There is no forced deletion success path. If workload deletion or node
-observation/teardown fails, cleanup fails and retains the target, driver,
-claims/volume, namespace and available manifests for recovery. Do not delete a
-retained target while a publication may still be mounted; resolve the reported
-node state first. Early setup failures without a possible publication still
-clean independent resources normally. A passing result is printed only after
-graceful cleanup succeeds.
-
-Known driver failure observed during the native baseline run: on Ubuntu 24.04
-with k3s v1.32.10, the locally built driver delivered through the test registry
-successfully mounted, formatted, wrote and read the scratch volume. Graceful
-teardown then failed the verification gate: NodeUnpublishVolume logged
-`the device is in use : 1` and returned success while the run's iSCSI session
-and device remained. The verifier timed out, returned a failing result and
-retained the fixture and supporting resources as intended. The cause remains
-under investigation in static CSI task S06; duplicate mount aliases are a
-hypothesis, not a confirmed diagnosis. This is a working regression detector,
-not a passing end-to-end acceptance result. Fixing the driver is separate work;
-do not weaken the cleanup assertions to make this baseline pass.
-
-## Locally built target fixture
-
-The harness builds `deploy/example/tgtd` from this checkout before creating
-cluster resources, loads it into the selected kind cluster or pushes it to the
-explicit test registry, and verifies the ready target pod's runtime image ID.
-`E2E_TARGET_IMAGE` selects an explicit non-latest/non-canary tag. Registry delivery
-requires it (for example `127.0.0.1:5000/iscsi-pr407-target:test`) and renders the
-matching immutable pushed digest, never a different repository's digest. Kind
-uses the loaded local image with `imagePullPolicy: Never`. The base image is
-pinned; the reported built image digest identifies the actual fixture tested.
-
-The target readiness probe queries live tgtadm configuration: the expected IQN,
-online LUN1, and backing-file path must all match. Startup fails if the daemon
-never becomes controllable, exits, or target configuration fails. The entrypoint
-bounds each control call (`TGTD_CONTROL_TIMEOUT`, default 3 seconds, plus a
-1-second forced-kill allowance) and terminates its own daemon on errors/signals
-with TERM followed by KILL after `TGTD_SHUTDOWN_TIMEOUT` (default 3 seconds); it does not leave a marker that can
-make a later failed daemon appear ready.
-
-A new backing file is sparsely initialized to `DISK_SIZE` MiB. An existing regular
-file of exactly that size is reused without truncation; mismatched sizes,
-symlinks and non-files fail instead of overwriting data. The deployment mounts
-`emptyDir` at `/var/lib/iscsi`, so bytes survive **container** restart in the same
-pod. Deleting/replacing the target pod or deleting the test namespace discards
-the scratch storage; it is not production persistence. Tests must not use real
-data as a fixture. The existing S06 teardown gate remains failing until fixed.
-
-For the standalone example, first build/load `iscsi-e2e-target:local` into your
-disposable cluster; its default pull policy deliberately refuses a remote image
-fallback. The main harness builds and selects its own image automatically.
-
-
-## Publication and restart scenarios
-
-`E2E_SCENARIOS` selects comma-separated cases: `baseline` (default), `republish`,
-`driver-restart`, or `target-restart`. `all` runs the three restart/publication
-cases in that order after the baseline write/read. Each case can also run alone,
-for example `E2E_SCENARIOS=target-restart` with the usual disposable-cluster and
-image settings. `E2E_SCENARIO_TIMEOUT` (default 180 seconds) bounds each case,
-including API calls and data reads. Image verification shares one monotonic
-budget across its pod query and all kind runtime inspection fallbacks; successful
-slow inspections cannot reset that budget.
-
-The workload pod only sleeps; the harness writes and syncs its payload once,
-after the first mount. Recreated pods and restart verification only read it.
-`republish` requires a newly created workload pod UID against the same PV/PVC.
-`driver-restart` replaces the installed driver pods, waits for new UIDs and the
-selected ready image, then reads the existing publication. `target-restart`
-terminates the target container and requires its restart count to increase in
-the **same** pod with the same PodIP before readiness/image and data checks.
-Replacing the target pod is rejected because its emptyDir would be new storage.
-
-A `Scenario ... data check passed; overall teardown pending` line reports only
-that transition's data check. Overall success still requires the final graceful
-node teardown gate. The observed S06 driver leak can therefore make the run fail
-after all scenario data checks pass; it is not converted to a skip or success.
-Failures report a scenario-specific stage without printing unexpected payloads.
-
-
-## Shared-target regression gate
-
-Select `E2E_SCENARIOS=shared-target` explicitly. `all` continues to select the
-restart scenarios; the shared-target gate is a separate, heavier regression
-case. The fixture exports LUN1 and LUN2 from distinct backing files under one
-IQN and requires both to be online before readiness. Both files are retained
-across container restarts in the same target pod.
-
-The scenario pins workload B to A's node, starts checked/fsynced B I/O, and
-requires two successful iterations before requesting A's graceful deletion. It
-keeps sampling B while A terminates. A worker restart, failure, reset progress
-or stalled progress fails; `E2E_SHARED_IO_TIMEOUT` (default 10 seconds) bounds
-I/O commands and progress gaps. A may pass removal only after its pod, node
-publication mount, LUN1 by-path and previously observed block devices disappear.
-B's LUN2 and shared session are allowed to remain. The scenario then republishes
-A without reseeding and verifies both payloads. Final cleanup checks **both**
-publication mount markers as well as the run's sessions and devices.
-
-The existing S06 leaked-device behavior can fail A's removal even while B I/O
-continues. That outcome is a failing safety gate, not proof that safe shared
-removal works; it can also mask the separate S07 target-wide logout defect.
-The harness does not change the driver or weaken these assertions. A failed
-run retains its fixture when requested, and failed verified final teardown
-always retains supporting resources for recovery.
-
-## Supported scenarios and feature gates
-
-This branch extends the test harness; it does not implement new driver APIs.
-The matrix describes this checkout and its recorded validation, not a capability
-probe against an arbitrary deployed driver.
-
-| `E2E_SCENARIOS` entry | Harness behavior and current evidence |
+| Selection | Check |
 | --- | --- |
-| `baseline` | Executable mount/write/read; observed data success, failing S06 final teardown. |
-| `republish` | Executable; observed data preservation after workload replacement; S06 final gate remains. |
-| `driver-restart` | Executable; observed data preservation after driver replacement; S06 final gate remains. |
-| `target-restart` | Executable; observed data preservation after same-pod target-container restart; S06 final gate remains. |
-| `shared-target` | Executable regression detector; observed A-removal failure. B progress alone is not safe-removal acceptance (S06/S07). |
-| `chap-secret-ref` | Gated: CSI `nodePublishSecretRef`/request Secrets are not consumed; existing legacy CHAP attributes are not evidence for this case. |
-| `stats` | Gated: `NodeGetVolumeStats` is unimplemented. |
-| `raw-block` | Gated: current node publication follows the filesystem format/mount path. |
-| `expansion` | Gated: `NodeExpandVolume` is unimplemented; manual backing-LUN growth is not a validated node resize workflow. |
-| `multipath` | Gated as unvalidated: existing connector logic needs distinct paths and path-failure/survival tests. Multiple portal strings alone are insufficient. |
+| `baseline` | Mount, seed and read a static filesystem volume. |
+| `republish` | Delete/recreate the workload pod and verify original bytes without reseeding. |
+| `driver-restart` | Replace driver pods on the same nodes, verify image identities, then check original bytes. |
+| `target-restart` | Restart the target container in the same pod/IP and check original bytes. |
+| `shared-target` | Publish two LUNs on one node; verify A's mount, remove A while B continues checked I/O without restarting, verify A's device removal, then republish A without reseeding. |
+| `all` | Republish, driver restart and target restart after baseline; shared-target is requested separately. |
 
-For example, `E2E_SCENARIOS=stats bash test/e2e/run-test.sh` reports the known
-feature gate and exits **78** before building images or querying/mutating the
-cluster. A mixed request such as `baseline,stats` is rejected as a whole; no
-selected case runs. Unknown or malformed selections exit **2** instead.
-Whitespace, including newlines, is rejected rather than ignoring trailing cases.
-Other nonzero statuses remain test, command, or timeout failures; zero is reserved for
-an executed run whose scenario and final cleanup checks all passed. Feature
-gates are never converted to skips or successful tests.
+`E2E_SCENARIOS` is a comma-separated list without whitespace. Requests containing
+`chap-secret-ref`, `stats`, `raw-block`, `expansion` or `multipath` return status
+78 with a reason before cluster access or image work. These features are
+unsupported or unvalidated here. Mixed executable/gated requests are atomic;
+unknown names, empty requests and malformed combinations return status2.
 
-`all` remains exactly the three restart/publication cases after the initial
-baseline data check. It does not silently include gated features or the explicit
-shared-target regression. Remove a gate only when its implementation and real
-integration tests have passed, and update this matrix with the tested evidence.
-Keep the existing S06/S07 regression failures distinct from unsupported API gates.
+## Cleanup and failures
 
+Each invocation has a random run ID and a separate ownership token. Resource
+creation is create-only, and deletion rechecks both labels and object identity.
+The suite snapshots owned node devices before removing workload pods, then
+requires the publication mounts, captured devices, target paths and sessions
+to disappear before deleting supporting target/driver objects, claims or the
+namespace. Individual-LUN checks permit B's shared session and devices to remain.
+Lost ownership, missing observations, residual devices and deadline expiry all
+fail cleanup and retain supporting resources for investigation.
 
-## Test commands and CI
+`E2E_RETAIN_ON_FAILURE=1` also retains the invocation after a scenario fails.
+Do not remove retained target/driver resources while a publication might still
+be mounted. Never treat manual recovery as a passing original test result.
 
-The Go tests and runners use a separate module in `test/e2e`; their dependencies
-are pinned in its `go.mod` and `go.sum`. The driver module and vendor tree are
-unchanged. No Ginkgo CLI installation is required. Command doubles re-execute
-the Go test binary. Python 3 is still used by the shell harness helpers and
-the existing repository boilerplate checker.
+Current native evidence includes a driver unpublish defect: the publication
+mount disappears but its device/session remains. The suite must fail that gate.
+No driver implementation is changed by these tests. See [validation](VALIDATION.md).
 
-Run `make e2e-unit` for unprivileged Ginkgo/Gomega command/failure tests.
-Run `make e2e-lint` for Go formatting/vet, ShellCheck, YAML and real repository
-license-header validation. Neither
-requires a target or cluster. `make e2e-fixture-test` builds this checkout's
-target and uses uniquely labeled Docker containers/volumes to test live protocol
-readiness, backing-byte preservation across restart, incompatible-file rejection
-and cleanup. It needs Docker access, not an iSCSI initiator. Its nonzero result
-is a failure, never a skipped pass.
+Timeout settings are positive integer seconds: `E2E_COMMAND_TIMEOUT` (330),
+`E2E_REQUEST_TIMEOUT` (30), `E2E_SCENARIO_TIMEOUT` (180),
+`E2E_TEARDOWN_TIMEOUT` (60), and `E2E_SHARED_IO_TIMEOUT` (10). Shared-target
+removal consumes the narrowest remaining scenario, teardown and B-progress
+budget. Cleanup has a separate bounded context so interruption cannot skip it.
 
-For native integration on an already prepared disposable cluster, set both
-registry image variables as above and run:
+## Recorded evidence and CI
 
 ```sh
-E2E_ARTIFACT_DIR=/tmp/new-iscsi-results E2E_SCENARIOS=all make e2e-record
+E2E_SCENARIOS=all E2E_ARTIFACT_DIR=/tmp/new-iscsi-results make e2e-record
 ```
 
-The artifact directory must be new. `bin/e2e-record` preserves the actual exit
-status and has a 1800-second whole-command limit (set `E2E_RECORD_TIMEOUT` for
-make, or `--timeout` when calling the recorder directly). The native CI job uses
-1200 seconds so its 30-minute job budget leaves setup and artifact-upload time.
-Its private, unlinked temporary raw output is discarded; the console and
-`summary.json` expose only exact data-phase markers, digest values, exit status,
-source revision and whitelisted node version fields. It never uploads raw logs,
-credentials, kubeconfig, manifests or event messages. A phase marker cannot turn
-a failing final status into success. Exit 78 remains a gate; exit 2 remains an
-input error. Use the direct harness and retained fixture for detailed debugging.
-`source_revision` is HEAD; `source_dirty` is true/false for any nonignored tracked
-or untracked worktree changes, or null when Git state cannot be determined.
-It stores no status paths or diff contents. A dirty record is not an exact
-clean-commit snapshot.
-Timeout or interruption terminates the entire owned process group, escalating
-TERM to KILL even if its leader already exited. A normally successful leader
-that leaves background test processes also fails after group cleanup; the
-summary distinguishes its `command_exit_code` from the final `exit_code`.
+The artifact directory must be new. The Go recorder executes the compiled
+Ginkgo suite, retains its actual status in `summary.json`, and enforces a whole
+run limit (`E2E_RECORD_TIMEOUT`, default1800 seconds). Its private unlinked raw
+output is discarded. Only exact successful data-phase markers, image digests,
+exit status, revision/dirty state and allowlisted node version fields are
+recorded; kubeconfig, annotations, payloads and arbitrary logs are excluded.
+A successful data phase does not override a teardown failure. Suite-level
+AfterSuite cleanup must succeed and emit verified-cleanup evidence; a native
+child exit0 without that evidence is a failure too. Gates remain78,
+input errors2, timeouts124 and interrupted runs128 plus the signal number.
+Make itself returns nonzero for a failed recipe; the summary preserves the
+suite's exact status. Background processes are cleaned up even if their leader
+has already exited. A successful leader leaving background processes fails.
 
-The `iSCSI harness tests` workflow runs unit, lint and real Docker fixture tests
-on pull requests. Its manually dispatched native job prepares only a fresh
-GitHub-hosted Ubuntu runner, runs pinned k3s with the registry delivery path, and
-uploads `summary.json` even on failure. It does not run against an existing
-cluster. There is no `continue-on-error`; the known S06 defect currently makes
-the native job fail. Local workflow validation is not evidence that GitHub ran
-the job. See [recorded validation](VALIDATION.md) for the actual environments
-and limitations.
+The PR workflow runs unit, lint and real Docker fixture checks. A manual native
+job prepares a fresh hosted Ubuntu runner, starts pinned k3s and a test registry,
+runs the Go suite and uploads only summary.json, including failed-run status.
+It does not use continue-on-error or claim a skipped storage case passed.

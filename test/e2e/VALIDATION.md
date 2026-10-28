@@ -1,107 +1,147 @@
-# Validation record and release gates
+# Validation and acceptance gates
 
-Recorded on 2026-10-27 for the PR #407 harness work. These are local results,
-not a claim that the GitHub workflow has executed or that the driver is ready
-for release. Driver implementations were unchanged.
+## Native-Go rewrite: 2026-10-28
 
-## Go test migration (2026-10-28)
+The implementation now uses actual Ginkgo v2 cluster specs, typed Kubernetes
+clients, Go node/data tools and Go target supervision. The shell harness and its
+command-order tests were replaced with tests of the Go behavior. Driver source
+under pkg/ and cmd/ was not changed.
 
-The test suite and its command doubles now use Go with Ginkgo v2 and Gomega.
-All 150 specs passed after the integration rewrite; the count expands the
-original Python subcases into individual specs. The Go result recorder and
-Docker fixture runner retain the same status and cleanup checks.
-`make e2e-lint`, the vendored driver-package checks, and the real Docker fixture
-test passed. Driver code, root dependencies, and the vendor tree are unchanged.
-The native iSCSI runs below were not repeated during this migration; their
-existing teardown failures remain release gates.
+Current checks:
 
-## Commands
+| Check | Result |
+| --- | --- |
+| Go helper tests | 235 Ginkgo/Gomega specs pass across 10 packages; no cluster access required. |
+| Root module | go mod tidy -diff produces no changes; vendored driver packages compile. |
+| Formatting/vet/license/YAML/workflow checks | Pass, including modern Go build-tag license handling. |
+| Repository-wide golangci-lint v2.15.0 | Zero issues with default settings and with the e2e build tag. |
+| Go target in real Docker | Pass: protocol-ready LUN, backing bytes survive restart, incompatible size rejected, owned resources removed. |
+| Native Go restart suite | Baseline, republish, driver restart and target-container restart data passed; child and recorder both exited1 on the residual-device teardown gate. |
+| Native Go shared target | B retained its UID, zero restarts, and checked-I/O progress15 to45 while A was absent; A device removal failed and both child/recorder exited1. |
+| Final image pipeline | Passed against real Docker29/containerd storage and the VM registry, including missing config metadata, hash-verified local OCI export, cached-index aliases and raw registry digest verification. |
 
-From a clean checkout with Python 3, Go, make, ShellCheck, yamllint and
-[actionlint v1.7.12](https://github.com/rhysd/actionlint/releases/tag/v1.7.12):
+The helper tests cover filesystem observations and API/process failure paths;
+they are not substitutes for a real mount, restart or teardown test. The `e2e`
+build tag keeps cluster specs out of ordinary unit runs. Unsupported feature
+requests return78; malformed requests and dry runs return2. An empty Ginkgo
+selection cannot report a successful acceptance run.
+
+## Native Go evidence
+
+The disposable Ubuntu24.04.5/kernel6.8.0-147/k3s1.32.10 VM used a private test
+registry and fresh generated run identities. The Go read-only validators,
+Go-supervised target, direct TCP connectivity and all three runtime image checks
+passed. The target-container restart retained the same pod/IP and increased its
+restart counter. Native data phases passed without reseeding after restarts.
+
+The current driver still returned a successful unpublish after logging
+`the device is in use : 1`, leaving generated devices/sessions. The corrected
+suite's global AfterSuite failed and TestE2E returned1. The recorder preserved
+command_exit_code1, exit_code1 and overall failed for both primary runs. Shared
+results contain only baseline as a successful data phase; B continuing I/O is
+not proof of successful A removal.
+
+Validation initially found a false-pass bug: Ginkgo2.21 attached an ordered
+DeferCleanup failure to the last skipped spec and returned0. That attempt was
+invalidated. Cleanup now runs in global AfterSuite, and the recorder also rejects
+a native exit0 without explicit verified-cleanup evidence. Two regressions
+exercise that acceptance contract. Primary native runs were repeated after the
+fix and correctly failed the driver gate.
+
+Repeated real image builds also exposed Docker29 OCI-index aliases and an
+exporter that omits the config digest from Buildx metadata. The implementation
+now obtains the exact build config from metadata or a hash-verified export of
+its immutable local descriptor, and resolves immutable registry/runtime
+platform descriptors to that config. It hashes raw descriptor bytes rather than
+trusting a mutable tag or Docker .Id semantics. Unit regressions and a final
+real image-only pipeline passed after the raw-hash hardening; scenario and
+probe code were unchanged by that final image-only check. A resourceVersion conflict seen
+during safe recovery also received bounded fresh-read retries with six
+regressions; UID and both ownership-label guards remain required on every
+attempt.
+
+After each failed invocation, recovery first verified both publication mounts
+were absent, then removed only the generated target IQN and matching connector
+records. Manual recovery does not change the failed original result. Private
+summaries are retained under /tmp/iscsi-native-go-vm/results-all-fixed and
+results-shared; the earlier invalidated attempt is separately labeled. These
+working-tree runs explicitly record source_dirty=true. Scratch mounts, sessions,
+connectors and owned resources were verified absent before shutting down the VM;
+its disks, SSH key and kubeconfig were removed. No GitHub workflow
+execution is claimed.
+
+## Reproduction
 
 ```sh
 make e2e-unit
 make e2e-lint
+golangci-lint run
 go test -mod=vendor ./pkg/... ./cmd/...
 make e2e-fixture-test
 ```
 
-The last command needs a usable Docker daemon and exercises actual tgtd control
-operations; it does not need Kubernetes, root host mounts or an initiator.
-Override `ACTIONLINT=/path/to/actionlint` for the lint target if needed. The
-unprivileged tests use isolated command doubles and temporary files; they do not
-prove kernel storage integration.
-
-For real native integration, use a fresh disposable Linux VM/node, prepare
-open-iscsi/iscsid/udev and TCP transport separately, install native Kubernetes,
-and configure a test registry accessible to both Docker and the node runtime.
-For the local single-node VM, a registry at `127.0.0.1:5000` was mirrored over
-HTTP in k3s containerd configuration. On a prepared cluster:
+For native tests, prepare a fresh disposable Linux Kubernetes node with
+open-iscsi/iscsid, udev and TCP transport. Provide a registry reachable from
+both Docker and the node runtime; configure its transport separately.
 
 ```sh
 export KUBECONFIG=/path/to/private-disposable-kubeconfig
 export E2E_DRIVER_DELIVERY=registry
-export E2E_DRIVER_IMAGE=127.0.0.1:5000/iscsi-driver:test
-export E2E_TARGET_IMAGE=127.0.0.1:5000/iscsi-target:test
+export E2E_DRIVER_IMAGE=registry.example/iscsi-driver:test
+export E2E_TARGET_IMAGE=registry.example/iscsi-target:test
+export E2E_TOOLS_IMAGE=registry.example/iscsi-tools:test
 E2E_SCENARIOS=all E2E_ARTIFACT_DIR=/tmp/new-restart-results make e2e-record
-# After recovering/cleaning that invocation, use a different new result path:
+# After safely recovering that invocation if necessary, use a new results path:
 E2E_SCENARIOS=shared-target E2E_ARTIFACT_DIR=/tmp/new-shared-results make e2e-record
 ```
 
-The native workflow contains the corresponding preparation for a disposable
-GitHub-hosted Ubuntu runner and pins k3s v1.32.10+k3s1. Normal harness execution
-does not perform this host preparation. Do not run preparation on a shared host.
+The recorder executes the compiled Go test binary directly, preserves its actual
+status in summary.json, and discards private raw output. Reports expose only
+successful data-phase markers, validated image digests, source revision/dirty
+state and selected node version fields. Credentials, node annotations, arbitrary
+logs and payload contents are not uploaded. A dirty record identifies the
+checkout revision and explicitly says the tested working tree differs from it.
+Native CI uploads only summary.json with if:always; failures remain failures.
 
-## Observed results
+## Behavior preserved during conversion
 
-| Check | Local evidence |
+| Behavior | Regression coverage |
 | --- | --- |
-| Unprivileged tests | Passing command/failure tests; run `make e2e-unit` for the current count. |
-| Shell/YAML/workflow/license checks | Passing after fixing the fail-open boilerplate reference path and normalizing added-file headers. |
-| Go packages | Compile/test command passed; driver packages under pkg/ and cmd/ currently contain no Go tests. |
-| Real Docker fixture | Protocol readiness passed; known backing bytes survived restart; incompatible existing size was rejected; owned container/volume cleanup passed. |
-| Registry image delivery | Local driver and target images deployed by matching immutable digest and verified ready runtime image IDs. |
-| Native baseline data | Mount, ext4 format, write and read passed. |
-| Native restart data | Republish, driver-pod restart and same-pod target-container restart all preserved the seeded payload. |
-| Native final teardown | **Failed.** Driver returned success after unmount while the device/session remained. Harness failed and retained supporting resources. |
-| Native shared-target case | **Failed A removal.** B had no restart and continued checked I/O (counter 522 to 540), but A's device remained. This is not a safe-removal pass. |
-| Unsupported/unvalidated features | Explicit non-success gates, not skipped successes; see the [support matrix](README.md#supported-scenarios-and-feature-gates). |
+| Requests validated before cluster/build work; mixed gates atomic | config: unit cases plus the actual compiled suite binary with unavailable tools/kubeconfig. |
+| Current-checkout builds, explicit tags, immutable registry selection | images: build/delivery failures, repository matching, invalid and ambiguous identities. |
+| Actual running image identity and aggregate deadline | images: ready/status checks, kind runtime resolution, desired-tag false-positive regression. |
+| No adopted or overwritten resources | testsuites: existing namespace/driver/run refusal, create failures and ownership races. |
+| Read-only host prerequisites | probe: temporary host-root/process/transport fixtures, executable symlinks and byte snapshots. |
+| PID1 mounts, owned sessions/paths/captured devices | probe: residual versus unobservable state, unrelated IQNs and per-LUN semantics. |
+| Seed once, fsync and exact-byte persistence | workload: exclusive creation, mismatch and write/read failure cases. |
+| B progress means completed checked I/O | workload: bounded Go subprocesses, failed initialization, missing progress parent and no false advancement. |
+| Publication and restart identities | testsuites: pod UID, node coverage, target pod/IP/container restart and no reseeding. |
+| Shared A removal while B continues | testsuites: known A mount/device, B identity/counter progress and narrow API/teardown deadlines. |
+| Safe final teardown and retention | testsuites: residual/unobservable nodes, ownership loss, changed validators, remaining cluster finalizers, and deadline-bound resourceVersion conflict retries that preserve UID/ownership. |
+| Target readiness and backing protection | targetfixture: exact IQN/LUN/path/online parsing, two LUNs, byte preservation, refusal and bounded shutdown. |
+| Recorder status/security/process cleanup | internal/runner: failures after data success, gates, signals, timeouts, descendants and allowlisted evidence. |
 
-The successful native data phases used Ubuntu 24.04.5, kernel
-6.8.0-147-generic, k3s v1.32.10+k3s1 and containerd 2.1.5-k3s1.32 in an isolated
-KVM VM. An earlier kind v1.27.3/containerd 1.7.1 environment passed image and
-prerequisite checks, but its iscsid died during kernel-control communication at
-login. That was an environment failure, not a passing storage integration run.
+Each component received an independent subagent review. Findings were fixed with
+regressions, including shared-target deletion deadlines, ownership loss during
+cleanup, missing /tmp in the scratch image, unsafe unused PID1 signaling, and
+incorrect desired-tag evidence during kind identity resolution.
 
-The native driver failure logged `the device is in use : 1` and left the scratch
-iSCSI device/session after the publication mount disappeared. The cause is still
-under investigation (static CSI work S06); duplicate mount aliases are a
-hypothesis. It may mask the target-wide logout defect tracked separately as S07.
-The harness does not repair the driver, force successful cleanup, or turn these
-results green. Native CI should remain red until the actual driver behavior is
-fixed and the gates pass.
+## Historical native results: 2026-10-27
 
-Manual recovery during local validation first verified **both** publication
-mounts were absent, then logged out only the generated scratch IQN, removed only
-its stale connector records, and ran checked ownership-scoped cleanup. Manual
-recovery is not part of a passing original test result. Retained fixtures must
-not be removed while a publication could still be mounted.
+These results came from the earlier shell implementation and are retained as
+context, not as proof that the rewritten Go suite passed.
 
-## Evidence artifacts
+In a disposable Ubuntu24.04.5/kernel6.8.0-147/k3s1.32.10 VM, baseline filesystem
+mount/write/read and republish, driver-pod restart and same-pod target-container
+restart preserved the seeded bytes. Final teardown failed: NodeUnpublishVolume
+returned success after unmount while the generated target's device/session
+remained (log message `the device is in use : 1`). The shared-target case also
+failed A removal while B continued checked I/O without restarting.
 
-`make e2e-record E2E_ARTIFACT_DIR=NEW_DIRECTORY` preserves the command's actual
-status in `summary.json`, even after successful data-phase messages. It records
-only exact phase markers, validated digest strings, exit status and selected
-source/node version fields. HEAD is recorded as `source_revision`; `source_dirty`
-is a boolean for any nonignored worktree changes, or null if unknown, with no raw
-status paths. A dirty record is not an exact clean-commit snapshot. Raw output is
-private temporary storage and discarded afterward; kubeconfig, Secret contents,
-manifests, payloads and arbitrary log or
-event messages are not uploaded. A secret-sentinel regression enforces this.
-Timeout returns 124; feature gates return 78; malformed input returns 2.
-
-The GitHub native job uploads that summary with `if: always()` and preserves the
-failing command result. Unit and Docker-fixture jobs are required on pull
-requests; native integration is manually dispatched to avoid pretending that
-mocked tests or an unsuitable container kernel establish acceptance.
+This is the S06 cleanup gate; it can mask the separate S07 target-wide logout
+concern. Tests must not force the results green or repair driver behavior.
+Manual recovery, when needed, first verifies both publication mounts are absent,
+then removes only the generated scratch IQN/connector records and owned resources.
+It does not change the failed original result. An earlier container-only kind
+attempt failed iscsid/kernel communication and did not establish native storage
+acceptance. No GitHub-hosted native workflow execution is claimed here.

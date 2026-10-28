@@ -18,10 +18,15 @@ package runner
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -37,6 +42,9 @@ var phasePattern = regexp.MustCompile(`^Scenario (baseline|republish|driver-rest
 var digestPattern = regexp.MustCompile(`sha256:[0-9a-f]{64}`)
 var imagePattern = regexp.MustCompile(`^(Driver|Target) image: \S+; local ID: sha256:[0-9a-f]{64}(; expected runtime ID: sha256:[0-9a-f]{64})?$`)
 var revisionPattern = regexp.MustCompile(`^[0-9a-f]{40,64}$`)
+
+// CleanupMarker is emitted only after suite-level teardown and completion checks.
+const CleanupMarker = "E2E cleanup verified; requested scenarios passed"
 
 // Record runs the selected command and writes only allowlisted evidence.
 func Record(args []string) int {
@@ -65,7 +73,11 @@ func Record(args []string) int {
 	command := flags.Args()
 	custom := len(command) > 0
 	if !custom {
-		command = []string{"bash", filepath.Join(root, "test/e2e/run-test.sh")}
+		suite := os.Getenv("E2E_SUITE_BINARY")
+		if suite == "" {
+			suite = filepath.Join(root, "bin/iscsi-e2e.test")
+		}
+		command = []string{suite, "-test.v"}
 	}
 	selected, ok := os.LookupEnv("E2E_SCENARIOS")
 	if !ok {
@@ -101,9 +113,11 @@ func Record(args []string) int {
 		}
 	}
 	code := 127
+	cleanupVerified := false
 	raw, err := os.CreateTemp("", "iscsi-record-output-*")
 	if err == nil {
-		defer raw.Close()
+		// This unlinked output is consumed before return; close does not publish data.
+		defer func() { _ = raw.Close() }()
 		if err = os.Remove(raw.Name()); err == nil {
 			cmd := exec.Command(command[0], command[1:]...)
 			cmd.Dir, cmd.Stdout, cmd.Stderr = root, raw, raw
@@ -127,11 +141,11 @@ func Record(args []string) int {
 					}
 				case <-timer.C:
 					stopGroup(cmd.Process.Pid)
-					<-done
+					summary["command_exit_code"] = exitCode(<-done) // Reap; preserve the timeout/signal as the final status.
 					code = 124
 				case sig := <-interrupts:
 					stopGroup(cmd.Process.Pid)
-					<-done
+					summary["command_exit_code"] = exitCode(<-done) // Reap; preserve the timeout/signal as the final status.
 					code = 128 + int(sig.(syscall.Signal))
 				}
 				timer.Stop()
@@ -145,6 +159,10 @@ func Record(args []string) int {
 				for {
 					line, err := reader.ReadString('\n')
 					line = strings.TrimSuffix(line, "\n")
+					if line == CleanupMarker {
+						cleanupVerified = true
+						fmt.Println(line)
+					}
 					if match := phasePattern.FindStringSubmatch(line); match != nil {
 						phases = append(phases, match[1])
 						fmt.Println(line)
@@ -171,10 +189,15 @@ func Record(args []string) int {
 	} else {
 		fmt.Fprintln(os.Stderr, "Unable to create private command output")
 	}
+	if !custom && code == 0 && !cleanupVerified {
+		code = 1
+		summary["acceptance"] = "teardown_unverified"
+	}
 	summary["exit_code"] = code
-	if code == 0 {
+	switch code {
+	case 0:
 		summary["overall"] = "passed"
-	} else if code == 78 {
+	case 78:
 		summary["overall"] = "gated"
 	}
 	if !custom && code != 2 && code != 78 && code != 127 {
@@ -218,42 +241,37 @@ func stopGroup(pid int) {
 }
 
 func nodeMetadata() ([]map[string]any, error) {
-	payload, err := capture(15*time.Second, "kubectl", "--request-timeout=10s", "get", "nodes", "-o", "json")
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	if file := os.Getenv("KUBECONFIG"); file != "" {
+		rules.ExplicitPath = file
+	}
+	cfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{}).ClientConfig()
 	if err != nil {
 		return nil, err
 	}
-	var data map[string]json.RawMessage
-	if err := json.Unmarshal(payload, &data); err != nil {
+	cfg.Timeout = 10 * time.Second
+	client, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
 		return nil, err
 	}
-	var items []map[string]json.RawMessage
-	if raw, ok := data["items"]; !ok || string(raw) == "null" {
-		return nil, fmt.Errorf("invalid node metadata")
-	} else if err := json.Unmarshal(raw, &items); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	nodes, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
 		return nil, err
 	}
-	nodes := []map[string]any{}
-	for _, item := range items {
-		if item == nil {
-			return nil, fmt.Errorf("invalid node metadata")
-		}
-		var status struct {
-			NodeInfo map[string]any `json:"nodeInfo"`
-		}
-		if raw, ok := item["status"]; ok {
-			if err := json.Unmarshal(raw, &status); err != nil {
-				return nil, err
-			}
-		}
-		node := map[string]any{}
-		for _, key := range []string{"osImage", "kernelVersion", "kubeletVersion", "containerRuntimeVersion"} {
-			value, ok := status.NodeInfo[key]
-			if !ok {
-				value = ""
-			}
-			node[key] = value
-		}
-		nodes = append(nodes, node)
+	return NodeMetadata(nodes), nil
+}
+
+// NodeMetadata exposes version fields only, never raw node metadata.
+func NodeMetadata(nodes *corev1.NodeList) []map[string]any {
+	result := []map[string]any{}
+	if nodes == nil {
+		return result
 	}
-	return nodes, nil
+	for _, node := range nodes.Items {
+		info := node.Status.NodeInfo
+		result = append(result, map[string]any{"osImage": info.OSImage, "kernelVersion": info.KernelVersion, "kubeletVersion": info.KubeletVersion, "containerRuntimeVersion": info.ContainerRuntimeVersion})
+	}
+	return result
 }

@@ -66,7 +66,7 @@ func Fixture(args []string) int {
 	ready := func() error {
 		deadline := time.Now().Add(40 * time.Second)
 		for time.Now().Before(deadline) {
-			if _, err := fixtureDocker(60*time.Second, "exec", name, "/ready.sh"); err == nil {
+			if _, err := fixtureDocker(60*time.Second, "exec", name, "/tgtd-fixture", "ready"); err == nil {
 				return nil
 			}
 			time.Sleep(time.Second)
@@ -74,7 +74,7 @@ func Fixture(args []string) int {
 		return errors.New("target never became protocol-ready")
 	}
 	run := func() error {
-		if _, err := fixtureDocker(600*time.Second, "build", "-t", image, filepath.Join(root, "deploy/example/tgtd")); err != nil {
+		if _, err := fixtureDocker(600*time.Second, "build", "-f", filepath.Join(root, "deploy/example/tgtd/Dockerfile"), "-t", image, root); err != nil {
 			return err
 		}
 		if _, err := fixtureDocker(60*time.Second, "volume", "create", "--label", label, volume); err != nil {
@@ -185,7 +185,7 @@ func fixtureDocker(timeout time.Duration, args ...string) ([]byte, error) {
 		return nil, &fixtureCommandError{exitCode(err)}
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
-		return nil, errors.New("Docker command timed out")
+		return nil, errors.New("docker command timed out")
 	}
 	return nil, errors.New("unable to run Docker command")
 }

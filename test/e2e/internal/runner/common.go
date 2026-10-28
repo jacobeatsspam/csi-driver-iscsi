@@ -40,7 +40,7 @@ func repositoryRoot() (string, error) {
 	}
 	for _, dir := range candidates {
 		for {
-			if _, err := os.Stat(filepath.Join(dir, "test/e2e/run-test.sh")); err == nil {
+			if _, err := os.Stat(filepath.Join(dir, "deploy/csi-iscsi-node.yaml")); err == nil {
 				if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
 					return dir, nil
 				}

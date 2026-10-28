@@ -52,7 +52,7 @@ spec:
             privileged: true
           readinessProbe:
             exec:
-              command: ["/ready.sh"]
+              command: ["/tgtd-fixture", "ready"]
             initialDelaySeconds: 1
             periodSeconds: 2
             timeoutSeconds: 5

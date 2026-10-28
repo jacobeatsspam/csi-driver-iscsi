@@ -12,6 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+FROM golang:1.26.0-bookworm AS builder
+ARG ARCH=amd64
+WORKDIR /src
+COPY go.mod go.sum ./
+COPY vendor ./vendor
+COPY test/e2e/targetfixture ./test/e2e/targetfixture
+COPY test/e2e/cmd/tgtd-fixture ./test/e2e/cmd/tgtd-fixture
+RUN CGO_ENABLED=0 GOARCH=${ARCH} go build -mod=vendor -trimpath -o /tgtd-fixture ./test/e2e/cmd/tgtd-fixture
+
 FROM ubuntu:22.04@sha256:e0f80c829509ef4df9e76bd8944eb7b8ec25cbb379b112a7f9448b2c77a77c9b
 
 RUN apt-get update && \
@@ -19,9 +28,8 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-COPY entrypoint.sh ready.sh /
-RUN chmod +x /entrypoint.sh /ready.sh
+COPY --from=builder /tgtd-fixture /tgtd-fixture
 
 EXPOSE 3260
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/tgtd-fixture", "serve"]
