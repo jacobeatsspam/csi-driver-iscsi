@@ -295,6 +295,35 @@ var _ = Describe("Harness", func() {
 		Expect(hasCall(r.Calls, "kubectl", "exec")).To(BeTrue())
 	})
 
+	It("validates prerequisites read-only against the host root", func() {
+		r := runHarness(nil)
+		Expect(r.Code).To(Equal(0), r.Stderr)
+		validator := hManifest(r.Calls, "name: prerequisites")
+		for _, text := range []string{"readinessProbe:", "- chroot\n                - /host", "readOnly: true", "hostPID: true"} {
+			Expect(validator).To(ContainSubstring(text))
+		}
+		for _, mutation := range []string{"apt-get", "yum ", "systemctl", "nsenter", "modprobe", "iscsid --"} {
+			Expect(validator).NotTo(ContainSubstring(mutation))
+		}
+		Expect(r.Stdout).To(ContainSubstring("no packages or services changed"))
+	})
+
+	It("stops before creating a target when prerequisites fail", func() {
+		r := runHarness(map[string]string{"FAILURE": "node-prerequisites"})
+		Expect(r.Code).To(Equal(37), r.Stderr)
+		Expect(r.Stderr).To(ContainSubstring("Node prerequisite validation failed"))
+		Expect(r.Stderr).To(ContainSubstring("iscsid is not running"))
+		Expect(hMatches(r.Calls, func(c []string) bool { return hPrefix(c, "manifest") && strings.Contains(c[1], "kind: Service") })).To(BeEmpty())
+		Expect(hasCall(r.Calls, "kubectl", "delete", "namespace")).To(BeTrue())
+	})
+
+	It("requires at least one eligible node", func() {
+		r := runHarness(map[string]string{"FAILURE": "no-nodes"})
+		Expect(r.Code).NotTo(Equal(0))
+		Expect(r.Stderr).To(ContainSubstring("at least one eligible node"))
+		Expect(hMatches(r.Calls, func(c []string) bool { return hPrefix(c, "manifest") && strings.Contains(c[1], "kind: Service") })).To(BeEmpty())
+	})
+
 	It("stops before driver installation on a closed target port", func() {
 		r := runHarness(map[string]string{"FAILURE": "connectivity"})
 		Expect(r.Code).To(Equal(1), r.Stderr)

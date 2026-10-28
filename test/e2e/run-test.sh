@@ -120,9 +120,10 @@ metadata:
     $CLEANUP_LABEL: "$CLEANUP_TOKEN"
 EOF
 
-STAGE=node-preparation
-# Step 0: Ensure open-iscsi is installed on all nodes
-echo "[0/7] Ensuring open-iscsi is installed on cluster nodes..."
+STAGE=node-prerequisites
+# Step 0: Validate the existing node setup without installing or starting anything.
+echo "[0/7] Checking node iSCSI prerequisites (read-only)..."
+NODE_CHECK=$(sed 's/^/                  /' "$SCRIPT_DIR/node-prerequisites.sh")
 cat <<EOF | kubectl create -f -
 apiVersion: apps/v1
 kind: DaemonSet
@@ -146,50 +147,56 @@ spec:
       nodeSelector:
         kubernetes.io/os: linux
       containers:
-        - name: iscsi-init
+        - name: prerequisites
           image: ubuntu:22.04
           securityContext:
             privileged: true
           command:
-            - nsenter
-            - --target
-            - "1"
-            - --mount
-            - --uts
-            - --ipc
-            - --net
-            - --pid
-            - --
-            - bash
+            - /bin/sh
             - -c
             - |
-              if ! command -v iscsiadm &>/dev/null; then
-                echo "Installing open-iscsi..."
-                apt-get update -qq && apt-get install -y -qq open-iscsi >/dev/null 2>&1 || \
-                yum install -y -q iscsi-initiator-utils >/dev/null 2>&1 || \
-                echo "WARNING: Could not install open-iscsi"
-              fi
-              # Ensure iscsid is running
-              if command -v systemctl &>/dev/null; then
-                systemctl enable iscsid --now 2>/dev/null || true
-              else
-                iscsid 2>/dev/null || true
-              fi
-              echo "open-iscsi ready"
-              sleep infinity
+              exec sleep infinity
+          readinessProbe:
+            exec:
+              command:
+                - chroot
+                - /host
+                - /bin/sh
+                - -c
+                - |
+$NODE_CHECK
+            initialDelaySeconds: 1
+            periodSeconds: 5
+            timeoutSeconds: 5
           volumeMounts:
             - name: host-root
               mountPath: /host
+              readOnly: true
       volumes:
         - name: host-root
           hostPath:
             path: /
 EOF
-echo "Waiting for iscsi-init DaemonSet to be ready..."
-kubectl rollout status daemonset/"$INIT_NAME" -n "$NAMESPACE" --timeout=300s
-# Give iscsid a moment to start
-sleep 5
-echo "open-iscsi installed on all nodes."
+echo "Waiting for node prerequisite checks..."
+if kubectl rollout status daemonset/"$INIT_NAME" -n "$NAMESPACE" --timeout=60s; then
+    prerequisite_status=$(kubectl get daemonset "$INIT_NAME" -n "$NAMESPACE" -o json)
+    python3 - "$prerequisite_status" <<'NODE_STATUS'
+import json, sys
+status = json.loads(sys.argv[1]).get('status', {})
+desired = status.get('desiredNumberScheduled', 0)
+if desired < 1 or status.get('numberReady', 0) != desired:
+    raise SystemExit('Node prerequisite validation requires at least one eligible node and all validators ready')
+NODE_STATUS
+    echo 'Node prerequisites verified; no packages or services changed.'
+else
+    prerequisite_result=$?
+    # This describes only our fixed validator's readiness errors. Do not fetch
+    # arbitrary application/driver logs or manifests that can contain secrets.
+    echo 'Node prerequisite validation failed; inspect readiness events for this validator:' >&2
+    kubectl get events -n "$NAMESPACE" --field-selector "involvedObject.kind=Pod" \
+        -o 'custom-columns=REASON:.reason,MESSAGE:.message' >&2 || true
+    exit "$prerequisite_result"
+fi
 
 STAGE=target-rollout
 # Step 1: Deploy iSCSI target server

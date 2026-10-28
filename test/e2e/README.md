@@ -4,14 +4,41 @@ Run only on a fresh disposable cluster with no existing installation of
 `iscsi.csi.k8s.io`. The harness refuses an existing CSIDriver, matching driver
 DaemonSet, or driver ConfigMap before build or mutation. It does not support
 adopting externally managed drivers: local-build verification is mandatory.
-The inherited harness still changes host packages and force-deletes workloads
-during cleanup; those are tracked separately in the PR #407 review backlog. No complete
+The inherited harness still force-deletes workloads during cleanup; graceful
+teardown is tracked separately in the PR #407 review backlog. No complete
 mount/unmount live-cluster pass has been recorded yet.
 
 The test builds the current checkout, including uncommitted changes, and installs
 the local driver manifests. It prints the source revision, built image ID and
 each verified driver pod imageID; it never installs an upstream canary instead.
 Python 3, Go, make, Docker and kubectl are required.
+
+Prepare disposable test nodes **before** running the harness: Linux, open-iscsi
+(`iscsiadm`), an active `iscsid`, the kernel's iSCSI TCP transport, and a running
+udev daemon are required. The harness only validates these prerequisites. Its
+privileged validator mounts each node root read-only and runs the fixed checks
+through `chroot /host` with the node PID namespace; it does not install packages,
+load modules, enable services or start daemons. A failed check keeps the validator
+unready and fails the test before the target or driver is installed. Zero eligible
+nodes cannot produce a passing validation. On failure, the harness prints the
+validator's readiness events (before any test credentials or application pods
+exist), which identify the missing prerequisite.
+
+Node preparation is a separate administrator operation, never automatic e2e
+behavior. For a disposable Debian/Ubuntu VM, install `open-iscsi` using its package
+manager, load `iscsi_tcp`, and start the node's `iscsid` and udev services using
+that system's service manager. Other Linux distributions use their own package
+and service names. These operations persist beyond test cleanup; use only a
+disposable VM/node and verify the correct host before performing them.
+
+For kind, the node container must have the initiator tools and active daemons,
+and shares the host kernel modules. Use a node image/module loader compatible
+with the host module compression. In our local environment the old kind image's
+kmod lacked Zstandard support, and udev's container condition prevented startup;
+those were resolved explicitly in the disposable node, outside the harness.
+Removing a kind cluster removes its container/service changes, but does not undo
+kernel modules loaded into the shared host kernel. A VM with a matching kernel
+and module loader avoids that container-specific preparation.
 
 For a disposable kind cluster:
 
