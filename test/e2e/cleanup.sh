@@ -9,6 +9,61 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Observe through validators while the driver and target are still available.
+# Snapshot device identities before deleting the publication, then wait for
+# unpublish to remove mounts, devices and the run-specific target session.
+verify_volume_teardown() {
+    local deadline=$((SECONDS + E2E_TEARDOWN_TIMEOUT)) remaining result validator
+    local node_check
+    node_check=$(cat "$SCRIPT_DIR/node-volume-clean.sh") || return 1
+    for validator in "${TEARDOWN_VALIDATORS[@]}"; do
+        while true; do
+            remaining=$((deadline - SECONDS))
+            if ((remaining <= 0)); then
+                echo 'Timed out waiting for run volume teardown; supporting resources retained' >&2
+                return 1
+            fi
+            if E2E_COMMAND_TIMEOUT=$remaining E2E_REQUEST_TIMEOUT=$remaining kubectl exec "$validator" -n "$NAMESPACE" -- \
+                chroot /host /bin/sh -c "$node_check" volume-clean check "$IQN" "$PV_NAME" "${TEARDOWN_DEVICES[$validator]}"; then
+                break
+            else
+                result=$?
+                if [[ $result != 1 ]]; then
+                    echo 'Cannot verify node volume teardown; supporting resources retained' >&2
+                    return "$result"
+                fi
+            fi
+            sleep 1
+        done
+    done
+}
+
+snapshot_volume_devices() {
+    local validators node_check validator validator_status
+    node_check=$(cat "$SCRIPT_DIR/node-volume-clean.sh") || return 1
+    validators=$(kubectl get pods -n "$NAMESPACE" -l "app=$INIT_NAME" -o json) || return 1
+    validator_status=$(kubectl get daemonset "$INIT_NAME" -n "$NAMESPACE" -o json) || return 1
+    validators=$(python3 - "$validators" "$validator_status" <<'VALIDATORS'
+import json, sys
+pods = json.loads(sys.argv[1]).get('items', [])
+desired = json.loads(sys.argv[2]).get('status', {}).get('desiredNumberScheduled', 0)
+nodes = [pod.get('spec', {}).get('nodeName') for pod in pods]
+ready = all(any(condition.get('type') == 'Ready' and condition.get('status') == 'True'
+                for condition in pod.get('status', {}).get('conditions', []))
+            and not pod.get('metadata', {}).get('deletionTimestamp') for pod in pods)
+if desired < 1 or len(pods) != desired or len(set(nodes)) != desired or not all(nodes) or not ready:
+    raise SystemExit('Cannot verify teardown without every node validator ready')
+for pod in pods:
+    print(pod['metadata']['name'])
+VALIDATORS
+    ) || return 1
+    mapfile -t TEARDOWN_VALIDATORS <<< "$validators"
+    for validator in "${TEARDOWN_VALIDATORS[@]}"; do
+        TEARDOWN_DEVICES[$validator]=$(kubectl exec "$validator" -n "$NAMESPACE" -- chroot /host /bin/sh -c \
+            "$node_check" volume-clean snapshot "$IQN" "$PV_NAME") || return 1
+    done
+}
+
 # All commands must check their status: this function is also called from an
 # EXIT trap and may run with errexit disabled or from a conditional.
 cleanup_resources() {
@@ -16,9 +71,24 @@ cleanup_resources() {
     if [[ ${CLEANUP_CLUSTER:-0} == 1 ]]; then
         local selector="$OWNER_LABEL=$E2E_RUN_ID,$CLEANUP_LABEL=$CLEANUP_TOKEN"
         echo "Cleaning up invocation $CLEANUP_TOKEN in namespace $NAMESPACE..."
-        # Graceful publication/device teardown is added by R06. Preserve the
-        # current workload deletion semantics until that task implements it.
-        kubectl delete pods -n "$NAMESPACE" -l "$selector" --grace-period=0 --force --ignore-not-found --timeout=60s || result=1
+        if [[ ${VOLUME_MAY_BE_PUBLISHED:-0} == 1 ]]; then
+            if ! snapshot_volume_devices; then
+                echo 'Cannot snapshot node devices; retaining resources for safe recovery' >&2
+                return 1
+            fi
+        fi
+        if kubectl delete pods -n "$NAMESPACE" -l "$selector" --wait=true --ignore-not-found --timeout="${E2E_TEARDOWN_TIMEOUT:-60}s"; then
+            if [[ ${VOLUME_MAY_BE_PUBLISHED:-0} == 1 ]] && ! verify_volume_teardown; then
+                echo 'Retaining target, driver, claims and namespace after failed teardown' >&2
+                return 1
+            fi
+        else
+            result=1
+            if [[ ${VOLUME_MAY_BE_PUBLISHED:-0} == 1 ]]; then
+                echo 'Workload deletion failed; retaining target, driver, claims and namespace' >&2
+                return 1
+            fi
+        fi
         kubectl delete pvc -n "$NAMESPACE" -l "$selector" --ignore-not-found --timeout=60s || result=1
         kubectl delete pv -l "$selector" --ignore-not-found --timeout=60s || result=1
         kubectl delete deployment,service -n "$NAMESPACE" -l "$selector" --ignore-not-found --timeout=60s || result=1

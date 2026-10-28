@@ -43,6 +43,9 @@ CLEANUP_TOKEN=$(python3 -c 'import secrets; print(secrets.token_hex(12))')
 CLEANUP_CLUSTER=0
 TARGET_MANIFEST=
 DRIVER_MANIFEST_DIR=
+VOLUME_MAY_BE_PUBLISHED=0
+declare -a TEARDOWN_VALIDATORS=()
+declare -A TEARDOWN_DEVICES=()
 E2E_RETAIN_ON_FAILURE=${E2E_RETAIN_ON_FAILURE:-0}
 if [[ "$E2E_RETAIN_ON_FAILURE" != 0 && "$E2E_RETAIN_ON_FAILURE" != 1 ]]; then
     echo 'E2E_RETAIN_ON_FAILURE must be 0 or 1' >&2; exit 2
@@ -54,7 +57,8 @@ LUN=1
 # timeout alone does not bound a remote process attached through exec.
 E2E_COMMAND_TIMEOUT=${E2E_COMMAND_TIMEOUT:-330}
 E2E_REQUEST_TIMEOUT=${E2E_REQUEST_TIMEOUT:-30}
-for duration in "$E2E_COMMAND_TIMEOUT" "$E2E_REQUEST_TIMEOUT"; do
+E2E_TEARDOWN_TIMEOUT=${E2E_TEARDOWN_TIMEOUT:-60}
+for duration in "$E2E_COMMAND_TIMEOUT" "$E2E_REQUEST_TIMEOUT" "$E2E_TEARDOWN_TIMEOUT"; do
     if [[ ! "$duration" =~ ^[1-9][0-9]*$ ]]; then
         echo 'E2E timeouts must be positive integer seconds' >&2
         exit 2
@@ -214,11 +218,23 @@ TARGET
 kubectl create -f "$TARGET_MANIFEST"
 kubectl rollout status deployment/"$TARGET_NAME" -n "${NAMESPACE}" --timeout=120s
 echo "iSCSI target server is ready."
-TARGET_HOST=$(kubectl get service "$TARGET_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}')
-python3 - "$TARGET_HOST" <<'ADDRESS'
-import ipaddress, sys
-ipaddress.ip_address(sys.argv[1])
+target_pods=$(kubectl get pods -n "$NAMESPACE" -l "app=$TARGET_NAME" -o json)
+# tgtd advertises its PodIP during SendTargets discovery. Using the ServiceIP
+# here creates a different node record from the one login/device lookup uses.
+TARGET_HOST=$(python3 - "$target_pods" <<'ADDRESS'
+import ipaddress, json, sys
+pods = [pod for pod in json.loads(sys.argv[1]).get('items', [])
+        if not pod.get('metadata', {}).get('deletionTimestamp')]
+if len(pods) != 1:
+    raise SystemExit('Expected exactly one ready target pod')
+pod = pods[0]
+ready = any(condition.get('type') == 'Ready' and condition.get('status') == 'True'
+            for condition in pod.get('status', {}).get('conditions', []))
+if not ready:
+    raise SystemExit('Target pod is not ready')
+print(ipaddress.ip_address(pod['status']['podIP']))
 ADDRESS
+)
 if [[ "$TARGET_HOST" == *:* ]]; then TARGET_PORTAL="[$TARGET_HOST]:3260"; else TARGET_PORTAL="$TARGET_HOST:3260"; fi
 
 STAGE=connectivity
@@ -253,7 +269,7 @@ spec:
     storage: 1Gi
   accessModes:
     - ReadWriteOnce
-  persistentVolumeReclaimPolicy: Delete
+  persistentVolumeReclaimPolicy: Retain
   csi:
     driver: iscsi.csi.k8s.io
     volumeHandle: ${PV_NAME}
@@ -292,6 +308,8 @@ echo "PVC created."
 STAGE=pod-create
 # Step 6: Create test pod
 echo "[6/7] Creating test pod..."
+# Arm before create: an API timeout can occur after the pod was accepted.
+VOLUME_MAY_BE_PUBLISHED=1
 cat <<EOF | kubectl create -f -
 apiVersion: v1
 kind: Pod

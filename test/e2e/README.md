@@ -112,9 +112,11 @@ objects (including cluster-scoped PVs and installed driver objects) carry the
 `iscsi.csi.k8s.io/e2e-run` ownership label; cleanup selects only that run. Creation
 uses `kubectl create`, so a collision cannot silently overwrite resources.
 
-The target has a run-specific name, selector and IQN. The PV uses the Service
-ClusterIP rather than service DNS because host iscsiadm does not necessarily use
-cluster DNS, and enables discovery for a fresh initiator. Driver registration
+The target has a run-specific name, selector and IQN. The PV uses the single
+ready target pod's validated IP and enables discovery for a fresh initiator.
+The real baseline exposed that tgtd advertises its PodIP during discovery: using
+the ServiceIP creates a node record for a different portal than login/device
+lookup expects. PodIP also avoids depending on node-side cluster DNS. Driver registration
 and node host paths remain global: run full harnesses sequentially on a cluster,
 not concurrently. Separate clusters are required for parallel runs.
 
@@ -129,3 +131,33 @@ make uninstall-iscsi-server ISCSI_SERVER_NAMESPACE=my-disposable-target
 Those commands use the example's names within that namespace and refuse to
 replace existing objects on installation. Uninstall selects only objects labeled
 as this example, not the run-specific e2e driver or resources.
+
+Static test PVs use `Retain`; deleting a Kubernetes object must not claim to
+delete backend storage. Cleanup deletes owned workload pods normally and waits
+for deletion. Before deletion, read-only validator commands snapshot block
+device names for this run's IQN. After deletion, validators inspect the node's
+`/proc/1/mountinfo`, run-specific iSCSI sessions/device paths, and captured block
+devices. They must all disappear before PVC/PV, target, validator and driver
+resources are removed. Unrelated IQNs and volumes are neither modified nor
+required to disappear.
+
+`E2E_TEARDOWN_TIMEOUT` defaults to 60 seconds and bounds the node teardown wait.
+There is no forced deletion success path. If workload deletion or node
+observation/teardown fails, cleanup fails and retains the target, driver,
+claims/volume, namespace and available manifests for recovery. Do not delete a
+retained target while a publication may still be mounted; resolve the reported
+node state first. Early setup failures without a possible publication still
+clean independent resources normally. A passing result is printed only after
+graceful cleanup succeeds.
+
+Known driver failure observed during the native baseline run: on Ubuntu 24.04
+with k3s v1.32.10, the locally built driver delivered through the test registry
+successfully mounted, formatted, wrote and read the scratch volume. Graceful
+teardown then failed the verification gate: NodeUnpublishVolume logged
+`the device is in use : 1` and returned success while the run's iSCSI session
+and device remained. The verifier timed out, returned a failing result and
+retained the fixture and supporting resources as intended. The cause remains
+under investigation in static CSI task S06; duplicate mount aliases are a
+hypothesis, not a confirmed diagnosis. This is a working regression detector,
+not a passing end-to-end acceptance result. Fixing the driver is separate work;
+do not weaken the cleanup assertions to make this baseline pass.

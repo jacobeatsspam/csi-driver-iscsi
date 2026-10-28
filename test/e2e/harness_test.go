@@ -344,7 +344,7 @@ var _ = Describe("Harness", func() {
 	It("stops before data verification on a wait timeout", func() {
 		r := runHarness(map[string]string{"FAILURE": "timeout"})
 		Expect(r.Code).To(Equal(124), r.Stderr)
-		Expect(hasCall(r.Calls, "kubectl", "exec")).To(BeFalse())
+		Expect(hMatches(r.Calls, func(c []string) bool { return hPrefix(c, "kubectl", "exec") && !slices.Contains(c, "volume-clean") })).To(BeEmpty())
 	})
 
 	It("preserves the data verification command status", func() {
@@ -381,7 +381,7 @@ var _ = Describe("Harness", func() {
 		}
 		Expect(target).NotTo(ContainSubstring("namespace: default"))
 		pv := hManifest(r.Calls, "kind: PersistentVolume\n")
-		for _, text := range []string{"targetPortal: \"10.96.0.17:3260\"", "discovery: \"true\"", "name: iscsi-pv-run123", "iscsi.csi.k8s.io/e2e-run: \"run123\""} {
+		for _, text := range []string{"targetPortal: \"10.244.0.17:3260\"", "discovery: \"true\"", "name: iscsi-pv-run123", "iscsi.csi.k8s.io/e2e-run: \"run123\""} {
 			Expect(pv).To(ContainSubstring(text))
 		}
 		for _, c := range r.Calls {
@@ -506,8 +506,13 @@ var _ = Describe("Harness", func() {
 			Expect(r.Code).To(Equal(tc.code), r.Stderr)
 			Expect(r.Stderr).To(ContainSubstring("E2E cleanup failed"))
 			Expect(r.Stdout).NotTo(ContainSubstring("E2E test PASSED"))
-			Expect(hasCall(r.Calls, "kubectl", "delete", "namespace")).To(BeTrue())
-			Expect(r.Artifacts).To(BeEmpty())
+			if tc.failure != "" {
+				Expect(hasCall(r.Calls, "kubectl", "delete", "namespace")).To(BeTrue())
+				Expect(r.Artifacts).To(BeEmpty())
+			} else {
+				Expect(hasCall(r.Calls, "kubectl", "delete", "namespace")).To(BeFalse())
+				Expect(r.Artifacts).NotTo(BeEmpty())
+			}
 		}
 	})
 
@@ -570,6 +575,51 @@ var _ = Describe("Harness", func() {
 		for _, c := range calls {
 			Expect(c).To(ContainSubstring("-l owner=run,invocation=unique"))
 			Expect(c).To(ContainSubstring("--ignore-not-found"))
+		}
+	})
+
+	It("observes node teardown before removing backing resources", func() {
+		r := runHarness(nil)
+		Expect(r.Code).To(Equal(0), r.Stderr)
+		Expect(hManifest(r.Calls, "kind: PersistentVolume\n")).To(ContainSubstring("persistentVolumeReclaimPolicy: Retain"))
+		snapshot := hIndex(r.Calls, func(c []string) bool { return hPrefix(c, "kubectl", "exec") && slices.Contains(c, "snapshot") })
+		deletePod := hIndex(r.Calls, func(c []string) bool { return hPrefix(c, "kubectl", "delete", "pods") })
+		check := hIndex(r.Calls, func(c []string) bool { return hPrefix(c, "kubectl", "exec") && slices.Contains(c, "check") })
+		deletePVC := hIndex(r.Calls, func(c []string) bool { return hPrefix(c, "kubectl", "delete", "pvc") })
+		deleteTarget := hIndex(r.Calls, func(c []string) bool { return hPrefix(c, "kubectl", "delete", "deployment,service") })
+		deleteValidator := hIndex(r.Calls, func(c []string) bool { return hPrefix(c, "kubectl", "delete", "daemonset") })
+		Expect(snapshot).To(BeNumerically("<", deletePod))
+		Expect(deletePod).To(BeNumerically("<", check))
+		Expect(check).To(BeNumerically("<", deletePVC))
+		Expect(deletePVC).To(BeNumerically("<", deleteTarget))
+		Expect(deleteTarget).To(BeNumerically("<", deleteValidator))
+		Expect(r.Calls[deletePod]).To(ContainElement("--wait=true"))
+		Expect(r.Calls[deletePod]).NotTo(ContainElement("--force"))
+		for _, c := range r.Calls {
+			Expect(c).NotTo(ContainElement("--grace-period=0"))
+		}
+	})
+
+	It("retains supporting resources when teardown fails or cannot be observed", func() {
+		for _, failure := range []string{"teardown-residual", "teardown-observe", "teardown-no-validators"} {
+			By(failure)
+			r := runHarness(map[string]string{"FAILURE": failure, "E2E_TEARDOWN_TIMEOUT": "1"})
+			Expect(r.Code).NotTo(Equal(0), r.Stderr)
+			Expect(r.Stderr).To(ContainSubstring("E2E cleanup failed"))
+			Expect(r.Stdout).NotTo(ContainSubstring("E2E test PASSED"))
+			for _, resource := range []string{"pvc", "pv", "deployment,service", "daemonset,configmap", "namespace"} {
+				Expect(hasCall(r.Calls, "kubectl", "delete", resource)).To(BeFalse())
+			}
+			Expect(r.Artifacts).NotTo(BeEmpty())
+		}
+	})
+
+	It("requires one ready target pod with the expected image and a valid address", func() {
+		for _, failure := range []string{"target-unready", "target-multiple", "target-bad-ip"} {
+			By(failure)
+			r := runHarness(map[string]string{"FAILURE": failure})
+			Expect(r.Code).NotTo(Equal(0), r.Stderr)
+			Expect(hMatches(r.Calls, func(c []string) bool { return hPrefix(c, "manifest") && strings.Contains(c[1], "kind: CSIDriver") })).To(BeEmpty())
 		}
 	})
 
