@@ -245,3 +245,37 @@ removal works; it can also mask the separate S07 target-wide logout defect.
 The harness does not change the driver or weaken these assertions. A failed
 run retains its fixture when requested, and failed verified final teardown
 always retains supporting resources for recovery.
+
+## Supported scenarios and feature gates
+
+This branch extends the test harness; it does not implement new driver APIs.
+The matrix describes this checkout and its recorded validation, not a capability
+probe against an arbitrary deployed driver.
+
+| `E2E_SCENARIOS` entry | Harness behavior and current evidence |
+| --- | --- |
+| `baseline` | Executable mount/write/read; observed data success, failing S06 final teardown. |
+| `republish` | Executable; observed data preservation after workload replacement; S06 final gate remains. |
+| `driver-restart` | Executable; observed data preservation after driver replacement; S06 final gate remains. |
+| `target-restart` | Executable; observed data preservation after same-pod target-container restart; S06 final gate remains. |
+| `shared-target` | Executable regression detector; observed A-removal failure. B progress alone is not safe-removal acceptance (S06/S07). |
+| `chap-secret-ref` | Gated: CSI `nodePublishSecretRef`/request Secrets are not consumed; existing legacy CHAP attributes are not evidence for this case. |
+| `stats` | Gated: `NodeGetVolumeStats` is unimplemented. |
+| `raw-block` | Gated: current node publication follows the filesystem format/mount path. |
+| `expansion` | Gated: `NodeExpandVolume` is unimplemented; manual backing-LUN growth is not a validated node resize workflow. |
+| `multipath` | Gated as unvalidated: existing connector logic needs distinct paths and path-failure/survival tests. Multiple portal strings alone are insufficient. |
+
+For example, `E2E_SCENARIOS=stats bash test/e2e/run-test.sh` reports the known
+feature gate and exits **78** before building images or querying/mutating the
+cluster. A mixed request such as `baseline,stats` is rejected as a whole; no
+selected case runs. Unknown or malformed selections exit **2** instead.
+Whitespace, including newlines, is rejected rather than ignoring trailing cases.
+Other nonzero statuses remain test, command, or timeout failures; zero is reserved for
+an executed run whose scenario and final cleanup checks all passed. Feature
+gates are never converted to skips or successful tests.
+
+`all` remains exactly the three restart/publication cases after the initial
+baseline data check. It does not silently include gated features or the explicit
+shared-target regression. Remove a gate only when its implementation and real
+integration tests have passed, and update this matrix with the tested evidence.
+Keep the existing S06/S07 regression failures distinct from unsupported API gates.

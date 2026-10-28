@@ -77,7 +77,7 @@ kubectl() {
 
 # shellcheck source=test/e2e/scenarios.sh
 source "$SCRIPT_DIR/scenarios.sh"
-validate_scenarios || exit 2
+validate_scenarios || exit "$?"
 
 STAGE=preparation
 failure_diagnostics() {

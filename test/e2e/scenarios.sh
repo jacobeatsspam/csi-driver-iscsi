@@ -39,21 +39,51 @@ spec:
 EOF
 }
 
+# These are harness gates, not successful tests or automatic capability probes.
+# Add a real scenario and passing integration evidence before removing a gate.
+scenario_gate_reason() {
+    case "$1" in
+        chap-secret-ref) echo 'CSI nodePublishSecretRef credentials are not implemented; the node currently reads legacy volume attributes' ;;
+        stats) echo 'NodeGetVolumeStats is unimplemented' ;;
+        raw-block) echo 'raw block publication is not implemented; the current node path formats and mounts filesystems' ;;
+        expansion) echo 'NodeExpandVolume is unimplemented; backing-LUN growth alone is not a tested resize workflow' ;;
+        multipath) echo 'multipath is unvalidated by this harness; distinct paths and path-failure evidence are required' ;;
+        *) return 1 ;;
+    esac
+}
+
 validate_scenarios() {
     E2E_SCENARIOS=${E2E_SCENARIOS-baseline}
+    # read -a consumes one line only. Reject whitespace rather than silently
+    # ignoring another requested case after a newline or normalizing input.
+    if [[ "$E2E_SCENARIOS" =~ [[:space:]] ]]; then
+        echo 'E2E_SCENARIOS must be a comma-separated list without whitespace' >&2
+        return 2
+    fi
     if [[ "$E2E_SCENARIOS" == all ]]; then
         E2E_SCENARIOS=republish,driver-restart,target-restart
     fi
     export TARGET_LUN_COUNT=1
-    local scenario
+    local scenario reason gated=
     IFS=, read -r -a SELECTED_SCENARIOS <<< "$E2E_SCENARIOS"
     [[ -n "$E2E_SCENARIOS" && "$E2E_SCENARIOS" != *, ]] || { echo 'E2E_SCENARIOS must not be empty' >&2; return 2; }
     for scenario in "${SELECTED_SCENARIOS[@]}"; do
         case "$scenario" in baseline|republish|driver-restart|target-restart|shared-target) ;;
-            *) echo "Unsupported E2E_SCENARIOS entry: $scenario" >&2; return 2 ;;
+            *)
+                if reason=$(scenario_gate_reason "$scenario"); then
+                    gated+="Feature gate $scenario: $reason."$'\n'
+                else
+                    echo "Unknown E2E_SCENARIOS entry: $scenario" >&2; return 2
+                fi
+                ;;
         esac
         if [[ "$scenario" == shared-target ]]; then TARGET_LUN_COUNT=2; fi
     done
+    if [[ -n "$gated" ]]; then
+        printf '%s' "$gated" >&2
+        echo 'No scenarios ran; requested feature gates are not passes (exit 78).' >&2
+        return 78
+    fi
 }
 
 verify_payload() {
