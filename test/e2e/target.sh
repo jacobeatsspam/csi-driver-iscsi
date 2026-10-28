@@ -47,3 +47,52 @@ prepare_target() {
     export TARGET_PULL_POLICY TARGET_EXPECTED_ID
     echo "Target image: $E2E_TARGET_IMAGE; local ID: $TARGET_LOCAL_ID"
 }
+
+# Verify the current ready target image and return its advertised address.
+target_endpoint() {
+# tgtd advertises its PodIP during SendTargets discovery. Using the ServiceIP
+# here creates a different node record from the one login/device lookup uses.
+python3 - "$NAMESPACE" "$TARGET_NAME" "$E2E_TARGET_IMAGE" "$TARGET_EXPECTED_ID" "$E2E_DRIVER_DELIVERY" "${E2E_COMMAND_TIMEOUT:-330}" "${E2E_REQUEST_TIMEOUT:-30}" <<'ADDRESS' || return
+import ipaddress, json, subprocess, sys, time
+namespace, name, image, expected, delivery, command_timeout, request_timeout = sys.argv[1:]
+command_timeout, request_timeout = int(command_timeout), int(request_timeout)
+if min(command_timeout, request_timeout) <= 0:
+    raise SystemExit("Image identity timeouts must be positive")
+deadline = time.monotonic() + command_timeout
+
+def bounded_output(args):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise SystemExit('Timed out resolving ' + delivery + ' target image identity')
+    try:
+        return subprocess.check_output(args, text=True, timeout=remaining)
+    except subprocess.TimeoutExpired:
+        raise SystemExit('Timed out resolving ' + delivery + ' target image identity')
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(error.returncode)
+
+payload = bounded_output(['kubectl', '--request-timeout=%ss' % min(request_timeout, command_timeout),
+                          'get', 'pods', '-n', namespace, '-l', 'app=' + name, '-o', 'json'])
+pods = [pod for pod in json.loads(payload).get('items', [])
+        if not pod.get('metadata', {}).get('deletionTimestamp')]
+if len(pods) != 1:
+    raise SystemExit('Expected exactly one ready target pod')
+pod = pods[0]
+ready = any(condition.get('type') == 'Ready' and condition.get('status') == 'True'
+            for condition in pod.get('status', {}).get('conditions', []))
+container = next((c for c in pod.get('spec', {}).get('containers', []) if c['name'] == 'tgtd'), {})
+status = next((c for c in pod.get('status', {}).get('containerStatuses', []) if c['name'] == 'tgtd'), {})
+runtime_id = status.get('imageID', '')
+actual = runtime_id.rsplit('@', 1)[-1].split('://')[-1]
+if actual != expected and delivery == 'kind' and runtime_id:
+    node = pod.get('spec', {}).get('nodeName', '')
+    if node:
+        inspection = bounded_output(['docker', 'exec', node, 'crictl', 'inspecti', '-o', 'json', runtime_id])
+        actual = json.loads(inspection)['status']['id']
+if not ready or not status.get('ready') or container.get('image') != image or actual != expected:
+    raise SystemExit('Target pod is not ready with the selected built image')
+if time.monotonic() > deadline:
+    raise SystemExit('Timed out resolving ' + delivery + ' target image identity')
+print(ipaddress.ip_address(pod['status']['podIP']))
+ADDRESS
+}

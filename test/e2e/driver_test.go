@@ -33,6 +33,15 @@ func init() { commandFakes["driver"] = fakeDriverCommand }
 
 func fakeDriverCommand(args []string) int {
 	name := filepath.Base(os.Args[0])
+	if name == "kubectl" {
+		filtered := []string{}
+		for _, arg := range args {
+			if !strings.HasPrefix(arg, "--request-timeout=") {
+				filtered = append(filtered, arg)
+			}
+		}
+		args = filtered
+	}
 	if err := appendCommand(os.Getenv("COMMAND_LOG"), append([]string{name}, args...)); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1

@@ -58,7 +58,8 @@ LUN=1
 E2E_COMMAND_TIMEOUT=${E2E_COMMAND_TIMEOUT:-330}
 E2E_REQUEST_TIMEOUT=${E2E_REQUEST_TIMEOUT:-30}
 E2E_TEARDOWN_TIMEOUT=${E2E_TEARDOWN_TIMEOUT:-60}
-for duration in "$E2E_COMMAND_TIMEOUT" "$E2E_REQUEST_TIMEOUT" "$E2E_TEARDOWN_TIMEOUT"; do
+E2E_SCENARIO_TIMEOUT=${E2E_SCENARIO_TIMEOUT:-180}
+for duration in "$E2E_COMMAND_TIMEOUT" "$E2E_REQUEST_TIMEOUT" "$E2E_TEARDOWN_TIMEOUT" "$E2E_SCENARIO_TIMEOUT"; do
     if [[ ! "$duration" =~ ^[1-9][0-9]*$ ]]; then
         echo 'E2E timeouts must be positive integer seconds' >&2
         exit 2
@@ -68,6 +69,10 @@ command -v timeout >/dev/null || { echo 'GNU timeout is required' >&2; exit 2; }
 kubectl() {
     timeout --foreground "${E2E_COMMAND_TIMEOUT}s" kubectl --request-timeout="${E2E_REQUEST_TIMEOUT}s" "$@"
 }
+
+# shellcheck source=test/e2e/scenarios.sh
+source "$SCRIPT_DIR/scenarios.sh"
+validate_scenarios || exit 2
 
 STAGE=preparation
 failure_diagnostics() {
@@ -224,33 +229,7 @@ TARGET
 kubectl create -f "$TARGET_MANIFEST"
 kubectl rollout status deployment/"$TARGET_NAME" -n "${NAMESPACE}" --timeout=120s
 echo "iSCSI target server is ready."
-target_pods=$(kubectl get pods -n "$NAMESPACE" -l "app=$TARGET_NAME" -o json)
-# tgtd advertises its PodIP during SendTargets discovery. Using the ServiceIP
-# here creates a different node record from the one login/device lookup uses.
-TARGET_HOST=$(python3 - "$target_pods" "$E2E_TARGET_IMAGE" "$TARGET_EXPECTED_ID" "$E2E_DRIVER_DELIVERY" <<'ADDRESS'
-import ipaddress, json, subprocess, sys
-payload, image, expected, delivery = sys.argv[1:]
-pods = [pod for pod in json.loads(payload).get('items', [])
-        if not pod.get('metadata', {}).get('deletionTimestamp')]
-if len(pods) != 1:
-    raise SystemExit('Expected exactly one ready target pod')
-pod = pods[0]
-ready = any(condition.get('type') == 'Ready' and condition.get('status') == 'True'
-            for condition in pod.get('status', {}).get('conditions', []))
-container = next((c for c in pod.get('spec', {}).get('containers', []) if c['name'] == 'tgtd'), {})
-status = next((c for c in pod.get('status', {}).get('containerStatuses', []) if c['name'] == 'tgtd'), {})
-runtime_id = status.get('imageID', '')
-actual = runtime_id.rsplit('@', 1)[-1].split('://')[-1]
-if actual != expected and delivery == 'kind' and runtime_id:
-    node = pod.get('spec', {}).get('nodeName', '')
-    if node:
-        inspection = subprocess.check_output(['docker', 'exec', node, 'crictl', 'inspecti', '-o', 'json', runtime_id], text=True)
-        actual = json.loads(inspection)['status']['id']
-if not ready or not status.get('ready') or container.get('image') != image or actual != expected:
-    raise SystemExit('Target pod is not ready with the selected built image')
-print(ipaddress.ip_address(pod['status']['podIP']))
-ADDRESS
-)
+TARGET_HOST=$(target_endpoint)
 if [[ "$TARGET_HOST" == *:* ]]; then TARGET_PORTAL="[$TARGET_HOST]:3260"; else TARGET_PORTAL="$TARGET_HOST:3260"; fi
 
 STAGE=connectivity
@@ -326,28 +305,7 @@ STAGE=pod-create
 echo "[6/7] Creating test pod..."
 # Arm before create: an API timeout can occur after the pod was accepted.
 VOLUME_MAY_BE_PUBLISHED=1
-cat <<EOF | kubectl create -f -
-apiVersion: v1
-kind: Pod
-metadata:
-  name: ${POD_NAME}
-  namespace: ${NAMESPACE}
-  labels:
-    $OWNER_LABEL: "$E2E_RUN_ID"
-    $CLEANUP_LABEL: "$CLEANUP_TOKEN"
-spec:
-  containers:
-    - name: test
-      image: busybox:1.36
-      command: ["sh", "-c", "echo 'iSCSI CSI test successful' > /mnt/test-file && cat /mnt/test-file && sleep 3600"]
-      volumeMounts:
-        - name: iscsi-vol
-          mountPath: /mnt
-  volumes:
-    - name: iscsi-vol
-      persistentVolumeClaim:
-        claimName: ${PVC_NAME}
-EOF
+create_test_pod
 
 echo "Waiting for test pod to be ready..."
 kubectl wait --for=condition=ready pod/"${POD_NAME}" -n "${NAMESPACE}" --timeout=300s
@@ -356,12 +314,11 @@ echo "Test pod is ready."
 STAGE=data-verification
 # Step 7: Verify
 echo "[7/7] Verifying mount..."
-RESULT=$(kubectl exec "${POD_NAME}" -n "${NAMESPACE}" -- cat /mnt/test-file)
-if [ "$RESULT" = "iSCSI CSI test successful" ]; then
-  EXIT_CODE=0
-else
-  echo "E2E data verification failed: unexpected file contents" >&2
-  failure_diagnostics 1
-fi
+# Seed only once. Recreated pods and restart checks must only read this file.
+EXPECTED_PAYLOAD='iSCSI CSI test successful'
+# shellcheck disable=SC2016
+kubectl exec "$POD_NAME" -n "$NAMESPACE" -- sh -c 'printf "%s\n" "$1" > /mnt/test-file && sync' seed "$EXPECTED_PAYLOAD"
+verify_payload
+run_scenarios
 
-exit $EXIT_CODE
+exit 0

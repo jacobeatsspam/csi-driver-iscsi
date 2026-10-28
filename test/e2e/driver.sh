@@ -75,12 +75,33 @@ install_driver() {
     kubectl "$operation" -f "$DRIVER_MANIFEST_DIR/csi-iscsi-driverinfo.yaml" || return
     kubectl "$operation" -f "$DRIVER_MANIFEST_DIR/csi-iscsi-node.yaml" || return
     kubectl rollout status daemonset/csi-iscsi-node -n kube-system --timeout=120s || return
-    local pods
-    pods=$(kubectl get pods -n kube-system -l app=csi-iscsi-node -o json) || return
-    python3 - "$E2E_DRIVER_IMAGE" "$DRIVER_EXPECTED_ID" "$pods" "$E2E_DRIVER_DELIVERY" <<'PY' || return
-import json, subprocess, sys
-image, expected, payload, delivery = sys.argv[1:]
-pods = json.loads(payload)['items']
+    verify_driver || return
+    rm -rf "$DRIVER_MANIFEST_DIR"
+}
+
+verify_driver() {
+    python3 - "$E2E_DRIVER_IMAGE" "$DRIVER_EXPECTED_ID" "$E2E_DRIVER_DELIVERY" "${E2E_COMMAND_TIMEOUT:-330}" "${E2E_REQUEST_TIMEOUT:-30}" <<'PY' || return
+import json, subprocess, sys, time
+image, expected, delivery, command_timeout, request_timeout = sys.argv[1:]
+command_timeout, request_timeout = int(command_timeout), int(request_timeout)
+if min(command_timeout, request_timeout) <= 0:
+    raise SystemExit("Image identity timeouts must be positive")
+deadline = time.monotonic() + command_timeout
+
+def bounded_output(args):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise SystemExit('Timed out resolving ' + delivery + ' driver image identity')
+    try:
+        return subprocess.check_output(args, text=True, timeout=remaining)
+    except subprocess.TimeoutExpired:
+        raise SystemExit('Timed out resolving ' + delivery + ' driver image identity')
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(error.returncode)
+
+payload = bounded_output(['kubectl', '--request-timeout=%ss' % min(request_timeout, command_timeout),
+                          'get', 'pods', '-n', 'kube-system', '-l', 'app=csi-iscsi-node', '-o', 'json'])
+pods = [pod for pod in json.loads(payload)['items'] if not pod.get('metadata', {}).get('deletionTimestamp')]
 if not pods:
     raise SystemExit('No driver pods found after rollout')
 for pod in pods:
@@ -95,11 +116,12 @@ for pod in pods:
         # Resolve that exact running image on its kind node, not its mutable tag.
         node = pod['spec'].get('nodeName', '')
         if node:
-            inspection = subprocess.check_output(['docker', 'exec', node, 'crictl', 'inspecti', '-o', 'json', runtime_id], text=True)
+            inspection = bounded_output(['docker', 'exec', node, 'crictl', 'inspecti', '-o', 'json', runtime_id])
             actual = json.loads(inspection)['status']['id']
     if spec['image'] != image or not status.get('ready') or actual != expected:
         raise SystemExit('Driver pod %s does not run the selected ready image: %s' % (pod['metadata']['name'], runtime_id))
+    if time.monotonic() > deadline:
+        raise SystemExit('Timed out resolving ' + delivery + ' driver image identity')
     print('Verified driver pod %s imageID=%s' % (pod['metadata']['name'], runtime_id))
 PY
-    rm -rf "$DRIVER_MANIFEST_DIR"
 }

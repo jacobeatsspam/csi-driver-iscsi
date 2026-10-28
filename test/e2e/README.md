@@ -192,3 +192,30 @@ data as a fixture. The existing S06 teardown gate remains failing until fixed.
 For the standalone example, first build/load `iscsi-e2e-target:local` into your
 disposable cluster; its default pull policy deliberately refuses a remote image
 fallback. The main harness builds and selects its own image automatically.
+
+
+## Publication and restart scenarios
+
+`E2E_SCENARIOS` selects comma-separated cases: `baseline` (default), `republish`,
+`driver-restart`, or `target-restart`. `all` runs the three restart/publication
+cases in that order after the baseline write/read. Each case can also run alone,
+for example `E2E_SCENARIOS=target-restart` with the usual disposable-cluster and
+image settings. `E2E_SCENARIO_TIMEOUT` (default 180 seconds) bounds each case,
+including API calls and data reads. Image verification shares one monotonic
+budget across its pod query and all kind runtime inspection fallbacks; successful
+slow inspections cannot reset that budget.
+
+The workload pod only sleeps; the harness writes and syncs its payload once,
+after the first mount. Recreated pods and restart verification only read it.
+`republish` requires a newly created workload pod UID against the same PV/PVC.
+`driver-restart` replaces the installed driver pods, waits for new UIDs and the
+selected ready image, then reads the existing publication. `target-restart`
+terminates the target container and requires its restart count to increase in
+the **same** pod with the same PodIP before readiness/image and data checks.
+Replacing the target pod is rejected because its emptyDir would be new storage.
+
+A `Scenario ... data check passed; overall teardown pending` line reports only
+that transition's data check. Overall success still requires the final graceful
+node teardown gate. The observed S06 driver leak can therefore make the run fail
+after all scenario data checks pass; it is not converted to a skip or success.
+Failures report a scenario-specific stage without printing unexpected payloads.
