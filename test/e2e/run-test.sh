@@ -19,9 +19,24 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-NAMESPACE="${NAMESPACE:-default}"
-TARGET_PORTAL="iscsi-server.${NAMESPACE}.svc.cluster.local:3260"
-IQN="iqn.2026-01.com.test:storage"
+# Names are stable within a run and unique across runs. A namespace supplied by
+# the caller must also be new: never adopt or delete an existing namespace.
+E2E_RUN_ID=${E2E_RUN_ID:-$(python3 -c 'import secrets; print(secrets.token_hex(6))')}
+if [[ ! "$E2E_RUN_ID" =~ ^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$ ]]; then
+    echo 'E2E_RUN_ID must be 1-20 lowercase alphanumeric/hyphen characters' >&2; exit 2
+fi
+NAMESPACE=${NAMESPACE:-iscsi-e2e-$E2E_RUN_ID}
+if [[ ! "$NAMESPACE" =~ ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$ ]]; then
+    echo 'NAMESPACE must be a DNS label (at most 63 characters)' >&2; exit 2
+fi
+TARGET_NAME=iscsi-target-$E2E_RUN_ID
+PV_NAME=iscsi-pv-$E2E_RUN_ID
+PVC_NAME=iscsi-pvc-$E2E_RUN_ID
+POD_NAME=iscsi-pod-$E2E_RUN_ID
+INIT_NAME=iscsi-init-$E2E_RUN_ID
+CONNECTIVITY_POD_NAME=iscsi-check-$E2E_RUN_ID
+OWNER_LABEL=iscsi.csi.k8s.io/e2e-run
+IQN=iqn.2026-01.com.test:storage-$E2E_RUN_ID
 LUN=1
 
 # Bound API calls as well as streaming exec/run commands. kubectl's request
@@ -58,25 +73,54 @@ echo "=== iSCSI CSI Driver E2E Test ==="
 # Build and deliver the checkout before mutating Kubernetes resources.
 # shellcheck source=test/e2e/driver.sh
 source "$SCRIPT_DIR/driver.sh"
+# Fresh-cluster mode: this driver has cluster-wide registration and fixed host
+# paths. Refuse to replace an existing installation, even in another namespace.
+# Cleanup uses ownership selectors for cluster-wide resources and driver
+# objects. A caller-supplied run ID must not adopt remnants of an earlier run.
+for resource in "namespace,pv,csidriver -l $OWNER_LABEL=$E2E_RUN_ID" "daemonset,configmap -n kube-system -l $OWNER_LABEL=$E2E_RUN_ID" "csidriver/iscsi.csi.k8s.io" "daemonset/csi-iscsi-node -n kube-system" "daemonsets.apps -A -l app=csi-iscsi-node" "configmap/configmap-csi-iscsiadm -n kube-system" "namespace/$NAMESPACE" "pv/$PV_NAME"; do
+    read -r -a resource_args <<< "$resource"
+    existing=$(kubectl get "${resource_args[@]}" --ignore-not-found -o name)
+    if [[ -n "$existing" ]]; then
+        echo "Refusing to reuse existing resource: $existing" >&2; exit 1
+    fi
+done
 prepare_driver
+# Label rendered local driver objects so cleanup can select only this run.
+python3 - "$DRIVER_MANIFEST_DIR" "$E2E_RUN_ID" <<'LABELS'
+import pathlib, sys
+for path in pathlib.Path(sys.argv[1]).glob('*.yaml'):
+    text = path.read_text().replace('\nmetadata:\n', '\nmetadata:\n  labels:\n    iscsi.csi.k8s.io/e2e-run: "' + sys.argv[2] + '"\n')
+    path.write_text(text)
+LABELS
+E2E_DRIVER_CREATE_ONLY=1
+cat <<EOF | kubectl create -f -
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: $NAMESPACE
+  labels:
+    $OWNER_LABEL: "$E2E_RUN_ID"
+EOF
 
 STAGE=node-preparation
 # Step 0: Ensure open-iscsi is installed on all nodes
 echo "[0/7] Ensuring open-iscsi is installed on cluster nodes..."
-cat <<EOF | kubectl apply -f -
+cat <<EOF | kubectl create -f -
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: iscsi-init
-  namespace: kube-system
+  name: $INIT_NAME
+  namespace: $NAMESPACE
+  labels:
+    $OWNER_LABEL: "$E2E_RUN_ID"
 spec:
   selector:
     matchLabels:
-      app: iscsi-init
+      app: $INIT_NAME
   template:
     metadata:
       labels:
-        app: iscsi-init
+        app: $INIT_NAME
     spec:
       hostPID: true
       hostNetwork: true
@@ -123,7 +167,7 @@ spec:
             path: /
 EOF
 echo "Waiting for iscsi-init DaemonSet to be ready..."
-kubectl rollout status daemonset/iscsi-init -n kube-system --timeout=300s
+kubectl rollout status daemonset/"$INIT_NAME" -n "$NAMESPACE" --timeout=300s
 # Give iscsid a moment to start
 sleep 5
 echo "open-iscsi installed on all nodes."
@@ -131,16 +175,32 @@ echo "open-iscsi installed on all nodes."
 STAGE=target-rollout
 # Step 1: Deploy iSCSI target server
 echo "[1/7] Deploying iSCSI target server..."
-kubectl apply -f "${REPO_ROOT}/deploy/example/iscsi-server.yaml"
-kubectl rollout status deployment/iscsi-server -n "${NAMESPACE}" --timeout=120s
+TARGET_MANIFEST=$(mktemp)
+python3 - "$REPO_ROOT/deploy/example/iscsi-server.yaml" "$TARGET_MANIFEST" "$TARGET_NAME" "$NAMESPACE" "$E2E_RUN_ID" "$IQN" <<'TARGET'
+import pathlib, re, sys
+source, output, name, namespace, run_id, iqn = sys.argv[1:]
+text = pathlib.Path(source).read_text().replace('name: iscsi-server', 'name: ' + name).replace('app: iscsi-server', 'app: ' + name)
+text = text.replace('name: ' + name + '\n', 'name: ' + name + '\n  namespace: ' + namespace + '\n')
+text = text.replace('iqn.2026-01.com.test:storage', iqn)
+text = re.sub(r'(?m)^  labels:\n', '  labels:\n    iscsi.csi.k8s.io/e2e-run: "' + run_id + '"\n', text)
+pathlib.Path(output).write_text(text)
+TARGET
+kubectl create -f "$TARGET_MANIFEST"
+kubectl rollout status deployment/"$TARGET_NAME" -n "${NAMESPACE}" --timeout=120s
 echo "iSCSI target server is ready."
+TARGET_HOST=$(kubectl get service "$TARGET_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}')
+python3 - "$TARGET_HOST" <<'ADDRESS'
+import ipaddress, sys
+ipaddress.ip_address(sys.argv[1])
+ADDRESS
+if [[ "$TARGET_HOST" == *:* ]]; then TARGET_PORTAL="[$TARGET_HOST]:3260"; else TARGET_PORTAL="$TARGET_HOST:3260"; fi
 
 STAGE=connectivity
 # Step 2: Verify iSCSI target is accessible
 echo "[2/7] Verifying iSCSI target is accessible..."
 # shellcheck source=test/e2e/checks.sh
 source "$SCRIPT_DIR/checks.sh"
-check_target_connectivity "iscsi-server.${NAMESPACE}.svc.cluster.local" 3260
+check_target_connectivity "$TARGET_HOST" 3260
 echo "iSCSI target connectivity check complete."
 
 STAGE=driver-install
@@ -154,11 +214,13 @@ echo "iSCSI CSI driver installed."
 STAGE=pv-create
 # Step 4: Create PV
 echo "[4/7] Creating PersistentVolume..."
-cat <<EOF | kubectl apply -f -
+cat <<EOF | kubectl create -f -
 apiVersion: v1
 kind: PersistentVolume
 metadata:
-  name: iscsi-e2e-test-pv
+  name: ${PV_NAME}
+  labels:
+    $OWNER_LABEL: "$E2E_RUN_ID"
 spec:
   capacity:
     storage: 1Gi
@@ -167,24 +229,27 @@ spec:
   persistentVolumeReclaimPolicy: Delete
   csi:
     driver: iscsi.csi.k8s.io
-    volumeHandle: iscsi-e2e-test-pv
+    volumeHandle: ${PV_NAME}
     volumeAttributes:
       targetPortal: "${TARGET_PORTAL}"
       iqn: "${IQN}"
       lun: "${LUN}"
       portals: "[]"
+      discovery: "true"
 EOF
 echo "PV created."
 
 STAGE=pvc-create
 # Step 5: Create PVC
 echo "[5/7] Creating PersistentVolumeClaim..."
-cat <<EOF | kubectl apply -f -
+cat <<EOF | kubectl create -f -
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: iscsi-e2e-test-pvc
+  name: ${PVC_NAME}
   namespace: ${NAMESPACE}
+  labels:
+    $OWNER_LABEL: "$E2E_RUN_ID"
 spec:
   accessModes:
     - ReadWriteOnce
@@ -192,19 +257,21 @@ spec:
     requests:
       storage: 1Gi
   storageClassName: ""
-  volumeName: iscsi-e2e-test-pv
+  volumeName: ${PV_NAME}
 EOF
 echo "PVC created."
 
 STAGE=pod-create
 # Step 6: Create test pod
 echo "[6/7] Creating test pod..."
-cat <<EOF | kubectl apply -f -
+cat <<EOF | kubectl create -f -
 apiVersion: v1
 kind: Pod
 metadata:
-  name: iscsi-e2e-test-pod
+  name: ${POD_NAME}
   namespace: ${NAMESPACE}
+  labels:
+    $OWNER_LABEL: "$E2E_RUN_ID"
 spec:
   containers:
     - name: test
@@ -216,17 +283,17 @@ spec:
   volumes:
     - name: iscsi-vol
       persistentVolumeClaim:
-        claimName: iscsi-e2e-test-pvc
+        claimName: ${PVC_NAME}
 EOF
 
 echo "Waiting for test pod to be ready..."
-kubectl wait --for=condition=ready pod/iscsi-e2e-test-pod -n "${NAMESPACE}" --timeout=300s
+kubectl wait --for=condition=ready pod/"${POD_NAME}" -n "${NAMESPACE}" --timeout=300s
 echo "Test pod is ready."
 
 STAGE=data-verification
 # Step 7: Verify
 echo "[7/7] Verifying mount..."
-RESULT=$(kubectl exec iscsi-e2e-test-pod -n "${NAMESPACE}" -- cat /mnt/test-file)
+RESULT=$(kubectl exec "${POD_NAME}" -n "${NAMESPACE}" -- cat /mnt/test-file)
 if [ "$RESULT" = "iSCSI CSI test successful" ]; then
   echo "✅ E2E test PASSED: iSCSI volume mounted and writable"
   EXIT_CODE=0
@@ -237,11 +304,14 @@ fi
 
 # Cleanup
 echo "Cleaning up..."
-kubectl delete pod iscsi-e2e-test-pod -n "${NAMESPACE}" --grace-period=0 --force 2>/dev/null || true
-kubectl delete pvc iscsi-e2e-test-pvc -n "${NAMESPACE}" 2>/dev/null || true
-kubectl delete pv iscsi-e2e-test-pv 2>/dev/null || true
-kubectl delete -f "${REPO_ROOT}/deploy/example/iscsi-server.yaml" 2>/dev/null || true
-kubectl delete daemonset iscsi-init -n kube-system 2>/dev/null || true
-"${REPO_ROOT}/deploy/uninstall-driver.sh" 2>/dev/null || true
+kubectl delete pods -n "${NAMESPACE}" -l "$OWNER_LABEL=$E2E_RUN_ID" --grace-period=0 --force 2>/dev/null || true
+kubectl delete pvc -n "${NAMESPACE}" -l "$OWNER_LABEL=$E2E_RUN_ID" 2>/dev/null || true
+kubectl delete pv -l "$OWNER_LABEL=$E2E_RUN_ID" 2>/dev/null || true
+kubectl delete deployment,service -n "$NAMESPACE" -l "$OWNER_LABEL=$E2E_RUN_ID" 2>/dev/null || true
+kubectl delete daemonset -n "$NAMESPACE" -l "$OWNER_LABEL=$E2E_RUN_ID" 2>/dev/null || true
+kubectl delete daemonset,configmap -n kube-system -l "$OWNER_LABEL=$E2E_RUN_ID" 2>/dev/null || true
+kubectl delete csidriver -l "$OWNER_LABEL=$E2E_RUN_ID" 2>/dev/null || true
+kubectl delete namespace -l "$OWNER_LABEL=$E2E_RUN_ID" 2>/dev/null || true
+rm -f "$TARGET_MANIFEST"
 
 exit $EXIT_CODE

@@ -93,8 +93,10 @@ PY
 }
 
 install_driver() {
-    kubectl apply -f "$DRIVER_MANIFEST_DIR/csi-iscsi-driverinfo.yaml" || return
-    kubectl apply -f "$DRIVER_MANIFEST_DIR/csi-iscsi-node.yaml" || return
+    local operation=apply
+    if [[ ${E2E_DRIVER_CREATE_ONLY:-0} == 1 ]]; then operation=create; fi
+    kubectl "$operation" -f "$DRIVER_MANIFEST_DIR/csi-iscsi-driverinfo.yaml" || return
+    kubectl "$operation" -f "$DRIVER_MANIFEST_DIR/csi-iscsi-node.yaml" || return
     kubectl rollout status daemonset/csi-iscsi-node -n kube-system --timeout=120s || return
     local pods
     pods=$(kubectl get pods -n kube-system -l app=csi-iscsi-node -o json) || return

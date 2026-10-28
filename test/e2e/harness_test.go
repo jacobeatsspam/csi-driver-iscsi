@@ -343,6 +343,108 @@ var _ = Describe("Harness", func() {
 		Expect(r.Code).To(Equal(17), r.Stderr)
 	})
 
+	It("uses the selected namespace and target IP in manifests", func() {
+		r := runHarness(map[string]string{"NAMESPACE": "dedicated-tests"})
+		Expect(r.Code).To(Equal(0), r.Stderr)
+		target := hManifest(r.Calls, "kind: Service")
+		for _, text := range []string{"namespace: dedicated-tests", "name: iscsi-target-run123", "app: iscsi-target-run123"} {
+			Expect(target).To(ContainSubstring(text))
+		}
+		Expect(target).NotTo(ContainSubstring("namespace: default"))
+		pv := hManifest(r.Calls, "kind: PersistentVolume\n")
+		for _, text := range []string{"targetPortal: \"10.96.0.17:3260\"", "discovery: \"true\"", "name: iscsi-pv-run123", "iscsi.csi.k8s.io/e2e-run: \"run123\""} {
+			Expect(pv).To(ContainSubstring(text))
+		}
+		for _, c := range r.Calls {
+			if hPrefix(c, "kubectl", "delete") {
+				Expect(c).To(ContainElement("iscsi.csi.k8s.io/e2e-run=run123"))
+			}
+			if hPrefix(c, "kubectl", "run") {
+				Expect(c).To(ContainElement("dedicated-tests"))
+			}
+		}
+	})
+
+	It("gives independent runs disjoint resource names", func() {
+		runs := []string{}
+		for _, id := range []string{"first", "second"} {
+			r := runHarness(map[string]string{"NAMESPACE": "ns-" + id, "E2E_RUN_ID": id})
+			Expect(r.Code).To(Equal(0), r.Stderr)
+			manifests := []string{}
+			for _, c := range r.Calls {
+				if hPrefix(c, "manifest") {
+					manifests = append(manifests, c[1])
+				}
+			}
+			runs = append(runs, strings.Join(manifests, "\n"))
+		}
+		for i, id := range []string{"first", "second"} {
+			Expect(runs[i]).To(ContainSubstring("iscsi-pv-" + id))
+			Expect(runs[i]).To(ContainSubstring("storage-" + id))
+		}
+		Expect(runs[1]).NotTo(ContainSubstring("iscsi-pv-first"))
+	})
+
+	It("refuses existing resources before creating or deleting anything", func() {
+		for _, resource := range []string{"csidriver/iscsi.csi.k8s.io", "daemonset/csi-iscsi-node", "daemonsets.apps", "configmap/configmap-csi-iscsiadm", "namespace/test-run", "pv/iscsi-pv-run123"} {
+			By(resource)
+			r := runHarness(map[string]string{"EXISTING_RESOURCE": resource})
+			Expect(r.Code).NotTo(Equal(0))
+			Expect(r.Stderr).To(ContainSubstring("Refusing to reuse"))
+			hNoMutation(r.Calls)
+		}
+	})
+
+	It("refuses earlier resources using the same run label", func() {
+		for _, resource := range []string{"namespace,pv,csidriver", "daemonset,configmap"} {
+			By(resource)
+			r := runHarness(map[string]string{"NAMESPACE": "new-namespace", "STALE_RUN": resource})
+			Expect(r.Code).NotTo(Equal(0))
+			Expect(r.Stderr).To(ContainSubstring("Refusing to reuse existing resource:"))
+			Expect(r.Stderr).To(ContainSubstring("earlier-"))
+			query := r.Calls[hIndex(r.Calls, func(c []string) bool { return hPrefix(c, "kubectl", "get", resource) })]
+			Expect(query).To(ContainElement("iscsi.csi.k8s.io/e2e-run=run123"))
+			hNoMutation(r.Calls)
+		}
+	})
+
+	It("checks the standard DaemonSet by name without relying on labels", func() {
+		r := runHarness(map[string]string{"EXISTING_RESOURCE": "daemonset/csi-iscsi-node"})
+		Expect(r.Code).NotTo(Equal(0))
+		Expect(r.Stderr).To(ContainSubstring("Refusing to reuse existing resource: daemonset/csi-iscsi-node"))
+		Expect(hMatches(r.Calls, func(c []string) bool {
+			return hPrefix(c, "kubectl", "get", "daemonset/csi-iscsi-node") && slices.Contains(c, "-n") && slices.Contains(c, "kube-system") && !slices.Contains(c, "-l")
+		})).NotTo(BeEmpty())
+		hNoMutation(r.Calls)
+	})
+
+	It("uses the selected namespace for example Make targets", func() {
+		for _, target := range []string{"install-iscsi-server", "uninstall-iscsi-server"} {
+			By(target)
+			r := runHarness(map[string]string{"NAMESPACE": "example-test", "MAKE_TARGET": target})
+			Expect(r.Code).To(Equal(0), r.Stderr)
+			calls := hMatches(r.Calls, func(c []string) bool { return c[0] == "kubectl" })
+			Expect(calls).NotTo(BeEmpty())
+			for _, c := range calls {
+				Expect(c).To(ContainElement("example-test"))
+			}
+			Expect(hasCall(calls, "kubectl", "apply")).To(BeFalse())
+		}
+	})
+
+	It("does not treat a failed preflight query as an absent resource", func() {
+		r := runHarness(map[string]string{"FAILURE": "preflight"})
+		Expect(r.Code).To(Equal(27), r.Stderr)
+		hNoMutation(r.Calls)
+	})
+
+	It("rejects invalid namespace and run ID inputs", func() {
+		for _, env := range []map[string]string{{"NAMESPACE": "default;bad"}, {"E2E_RUN_ID": "../../escape"}, {"E2E_RUN_ID": "trailing-"}} {
+			r := runCommand(env, "bash", filepath.Join(repoRoot, "test/e2e/run-test.sh"))
+			Expect(r.Code).To(Equal(2), r.Stderr)
+		}
+	})
+
 	It("requires a positive command timeout", func() {
 		r := runCommand(map[string]string{"E2E_COMMAND_TIMEOUT": "0"}, "bash", filepath.Join(repoRoot, "test/e2e/run-test.sh"))
 		Expect(r.Code).To(Equal(2), r.Stderr)

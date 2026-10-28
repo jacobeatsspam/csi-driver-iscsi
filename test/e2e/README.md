@@ -1,8 +1,12 @@
 # iSCSI e2e tests
 
-Run only on a disposable cluster. The inherited harness still changes host
-packages and has incomplete resource cleanup; those are tracked separately in
-the PR #407 review backlog. No live-cluster pass has been recorded yet.
+Run only on a fresh disposable cluster with no existing installation of
+`iscsi.csi.k8s.io`. The harness refuses an existing CSIDriver, matching driver
+DaemonSet, or driver ConfigMap before build or mutation. It does not support
+adopting externally managed drivers: local-build verification is mandatory.
+The inherited harness still changes host packages and has incomplete failure
+cleanup; those are tracked separately in the PR #407 review backlog. No complete
+mount/unmount live-cluster pass has been recorded yet.
 
 The test builds the current checkout, including uncommitted changes, and installs
 the local driver manifests. It prints the source revision, built image ID and
@@ -51,5 +55,33 @@ credentials. Diagnostics failing does not replace the original failure status.
 For a separate negative connectivity integration check on a disposable cluster,
 source `test/e2e/checks.sh`, set `NAMESPACE`, and call
 `check_target_connectivity HOST PORT` under an outer timeout. The helper propagates
-the remote TCP check's nonzero status. Resource isolation and failure cleanup
-remain pending in the next tasks.
+the remote TCP check's nonzero status. Failure cleanup remains pending in the next task.
+
+Each run generates a random `E2E_RUN_ID` and a new `iscsi-e2e-RUN_ID` namespace.
+You can set `NAMESPACE` to a different **new** namespace and `E2E_RUN_ID` to a
+1–20 character lowercase alphanumeric/hyphen identifier. Existing namespaces and
+same-named PVs are rejected, including when their labels appear to match. A run
+ID with existing namespace/PV/CSIDriver or driver-resource ownership labels is
+also rejected, even when selecting a different namespace, so stale runs cannot
+be adopted or cleaned up by a new invocation. Test
+objects (including cluster-scoped PVs and installed driver objects) carry the
+`iscsi.csi.k8s.io/e2e-run` ownership label; cleanup selects only that run. Creation
+uses `kubectl create`, so a collision cannot silently overwrite resources.
+
+The target has a run-specific name, selector and IQN. The PV uses the Service
+ClusterIP rather than service DNS because host iscsiadm does not necessarily use
+cluster DNS, and enables discovery for a fresh initiator. Driver registration
+and node host paths remain global: run full harnesses sequentially on a cluster,
+not concurrently. Separate clusters are required for parallel runs.
+
+Standalone example fixture targets also require an explicit namespace:
+
+```sh
+kubectl create namespace my-disposable-target
+make install-iscsi-server ISCSI_SERVER_NAMESPACE=my-disposable-target
+make uninstall-iscsi-server ISCSI_SERVER_NAMESPACE=my-disposable-target
+```
+
+Those commands use the example's names within that namespace and refuse to
+replace existing objects on installation. Uninstall selects only objects labeled
+as this example, not the run-specific e2e driver or resources.

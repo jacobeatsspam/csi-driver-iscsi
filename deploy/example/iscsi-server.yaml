@@ -17,7 +17,8 @@ apiVersion: v1
 kind: Service
 metadata:
   name: iscsi-server
-  namespace: default
+  labels:
+    iscsi.csi.k8s.io/example: "true"
 spec:
   type: ClusterIP
   ports:
@@ -31,7 +32,8 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: iscsi-server
-  namespace: default
+  labels:
+    iscsi.csi.k8s.io/example: "true"
 spec:
   replicas: 1
   selector:

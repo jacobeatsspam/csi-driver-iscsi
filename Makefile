@@ -56,14 +56,18 @@ clean:
 	go clean -mod=vendor -r -x
 	rm -f bin/iscsiplugin
 
+# Standalone example fixture commands require an explicitly selected namespace.
+ISCSI_SERVER_NAMESPACE ?=
 .PHONY: install-iscsi-server
 install-iscsi-server:
-	kubectl apply -f deploy/example/iscsi-server.yaml
-	kubectl rollout status deployment/iscsi-server --timeout=120s
+	@test -n "$(ISCSI_SERVER_NAMESPACE)" || (echo 'Set ISCSI_SERVER_NAMESPACE to a dedicated existing namespace' >&2; exit 2)
+	kubectl create -f deploy/example/iscsi-server.yaml -n "$(ISCSI_SERVER_NAMESPACE)"
+	kubectl rollout status deployment/iscsi-server -n "$(ISCSI_SERVER_NAMESPACE)" --timeout=120s
 
 .PHONY: uninstall-iscsi-server
 uninstall-iscsi-server:
-	kubectl delete -f deploy/example/iscsi-server.yaml --ignore-not-found
+	@test -n "$(ISCSI_SERVER_NAMESPACE)" || (echo 'Set ISCSI_SERVER_NAMESPACE to a dedicated existing namespace' >&2; exit 2)
+	kubectl delete deployment,service -n "$(ISCSI_SERVER_NAMESPACE)" -l iscsi.csi.k8s.io/example=true --ignore-not-found
 
 .PHONY: e2e-test
 e2e-test:
