@@ -1,0 +1,80 @@
+---
+name: Fork image
+
+on:
+  push:
+    branches:
+      - temp-master
+      - 'fork-release-*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# Serialize builds of the same ref without cancelling a publication in progress.
+concurrency:
+  group: fork-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.repository == 'jacobeatsspam/csi-driver-iscsi' &&
+      (github.ref == 'refs/heads/temp-master' ||
+       startsWith(github.ref, 'refs/heads/fork-release-'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/jacobeatsspam/csi-driver-iscsi
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Unit tests
+        run: go test -mod=vendor ./pkg/... ./cmd/... ./test/e2e/...
+      - name: Build Linux binaries
+        run: |
+          make iscsi ARCH=amd64
+          make iscsi ARCH=arm64
+      - name: Publish multiarch image
+        id: image
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DOCKER_CONFIG="$RUNNER_TEMP/fork-docker"
+          mkdir -p "$DOCKER_CONFIG"
+          trap 'docker logout ghcr.io >/dev/null 2>&1; rm -rf "$DOCKER_CONFIG"' EXIT
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          docker buildx create --use --name fork-builder
+          # The Dockerfile installs target-architecture packages. Build natively
+          # on amd64 and register emulation for the arm64 image.
+          docker run --privileged --rm tonistiigi/binfmt:qemu-v9.2.0 --install arm64
+          for arch in amd64 arm64; do
+            docker buildx build --pull --push --platform "linux/$arch" \
+              --build-arg "ARCH=$arch" \
+              --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+              --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+              --tag "$IMAGE:sha-$GITHUB_SHA-$arch" .
+          done
+          docker buildx imagetools create --tag "$IMAGE:sha-$GITHUB_SHA" \
+            "$IMAGE:sha-$GITHUB_SHA-amd64" "$IMAGE:sha-$GITHUB_SHA-arm64"
+          digest=$(docker buildx imagetools inspect "$IMAGE:sha-$GITHUB_SHA" \
+            --format '{{json .Manifest}}' | jq -r .digest)
+          test -n "$digest" && test "$digest" != null
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          {
+            echo '### Fork image'
+            printf '\nSource: %s\n\nDeploy: %s@%s\n' "$GITHUB_SHA" "$IMAGE" "$digest"
+            echo
+            echo 'Publication passed unit tests; storage lifecycle validation and promotion are separate.'
+          } >> "$GITHUB_STEP_SUMMARY"

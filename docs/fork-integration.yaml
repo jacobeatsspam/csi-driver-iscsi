@@ -1,0 +1,16 @@
+---
+# Assembly inputs, not a deployment lock. Update SHAs before each rebuild.
+upstream:
+  remote: upstream
+  ref: master
+  sha: 6c1fd20ef566b45cd7527734bcdf8331be002c23
+topics:
+  - branch: complete-e2e-tests
+    sha: 1659866be66e62847cc5daa755fcbbbdf3e42c3f
+    depends_on: []
+# Keep fork workflow/docs commits when rebuilding; do not merge the integration
+# branch back into any topic. Record conflict resolutions as separate commits.
+fork_files:
+  - .github/workflows/fork-image.yaml
+  - docs/fork-integration.yaml
+  - docs/fork-releases.md
