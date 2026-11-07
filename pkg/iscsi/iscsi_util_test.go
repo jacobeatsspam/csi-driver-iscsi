@@ -58,3 +58,21 @@ func TestUnsharedPortals(t *testing.T) {
 		t.Fatal("invalid connection record was accepted")
 	}
 }
+
+func TestDeviceMountedWithSymlinkAliases(t *testing.T) {
+	dir := t.TempDir()
+	device := filepath.Join(dir, "device")
+	if err := os.WriteFile(device, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	first, second := filepath.Join(dir, "first"), filepath.Join(dir, "second")
+	for _, link := range []string{first, second} {
+		if err := os.Symlink(device, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mounter := mount.NewFakeMounter([]mount.MountPoint{{Device: second, Path: "/other"}})
+	if inUse, err := deviceMounted(mounter, first); err != nil || !inUse {
+		t.Fatalf("deviceMounted with aliases = %v, %v", inUse, err)
+	}
+}
