@@ -29,9 +29,9 @@ import (
 
 func TestLocalActRequiresDisposableVM(t *testing.T) {
 	for _, tc := range []struct {
-		name, optIn, virt, actExit string
-		wantExit                   int
-		wantAct                    bool
+		name, disposableVM, virt, actExit string
+		wantExit                          int
+		wantAct                           bool
 	}{
 		{"no opt in", "", "0", "0", 2, false},
 		{"not a VM", "1", "1", "0", 2, false},
@@ -50,7 +50,7 @@ func TestLocalActRequiresDisposableVM(t *testing.T) {
 				}
 			}
 			cmd := exec.Command("bash", "../local-act-in-vm.sh")
-			cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"), "E2E_DISPOSABLE_VM="+tc.optIn,
+			cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"), "E2E_DISPOSABLE_VM="+tc.disposableVM,
 				"FAKE_VIRT="+tc.virt, "FAKE_ACT_EXIT="+tc.actExit, "FAKE_LOG="+log,
 				"DOCKER_CONTEXT=remote", "DOCKER_HOST=tcp://remote:2375")
 			output, err := cmd.CombinedOutput()
