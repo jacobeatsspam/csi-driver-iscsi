@@ -1,0 +1,11 @@
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: targetd
+provisioner: iscsi.csi.k8s.io
+parameters:
+  pool: vg-targetd
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+allowVolumeExpansion: false

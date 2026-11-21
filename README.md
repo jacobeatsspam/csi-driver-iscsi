@@ -2,10 +2,9 @@
 
 ### Overview
 
-This is a repository for iscsi [CSI](https://kubernetes-csi.github.io/docs/)
-driver, csi plugin name: `iscsi.csi.k8s.io`. This driver requires existing and
-already configured iscsi server, it could dynamically attach/mount,
-detach/unmount based on CSI GRPC calls.
+The `iscsi.csi.k8s.io` CSI driver mounts existing iSCSI volumes on Kubernetes
+nodes. Its optional targetd controller creates logical volumes and manages
+per-node exports on a configured appliance. See the [targetd guide](./docs/targetd.md).
 
 ### Project status: Alpha
 
@@ -18,6 +17,7 @@ detach/unmount based on CSI GRPC calls.
 ### Install driver on a Kubernetes cluster
 
 - install by [kubectl](./docs/install-iscsi-csi-driver.md)
+- install by [Helm](./charts/README.md)
 
 ### Troubleshooting
 

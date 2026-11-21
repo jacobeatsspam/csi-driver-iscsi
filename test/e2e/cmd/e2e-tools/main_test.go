@@ -57,6 +57,31 @@ var _ = Describe("Go tools command interface", func() {
 		code := run(args, &out, &err)
 		return code, out.String(), err.String()
 	}
+	It("logs out only the unique fixture target when its session exists", func() {
+		root := GinkgoT().TempDir()
+		dir := filepath.Join(root, "sys/class/iscsi_session/session1")
+		Expect(os.MkdirAll(dir, 0755)).To(Succeed())
+		original := logoutTarget
+		DeferCleanup(func() { logoutTarget = original })
+		called := 0
+		logoutTarget = func(_ context.Context, r, iqn string) error {
+			called++
+			Expect(r).To(Equal(root))
+			Expect(iqn).To(Equal("iqn.2026-01.com.test:storage-run"))
+			return nil
+		}
+		Expect(os.WriteFile(filepath.Join(dir, "targetname"), []byte("iqn.other:target\n"), 0600)).To(Succeed())
+		code, _, _ := execute("logout-fixture", "--root="+root, "--iqn=iqn.2026-01.com.test:storage-run")
+		Expect(code).To(Equal(0))
+		Expect(called).To(Equal(0))
+		Expect(os.WriteFile(filepath.Join(dir, "targetname"), []byte("iqn.2026-01.com.test:storage-run\n"), 0600)).To(Succeed())
+		code, _, _ = execute("logout-fixture", "--root="+root, "--iqn=iqn.2026-01.com.test:storage-run")
+		Expect(code).To(Equal(0))
+		Expect(called).To(Equal(1))
+		code, _, _ = execute("logout-fixture", "--root="+root, "--iqn=iqn.other:target")
+		Expect(code).To(Equal(1))
+		Expect(called).To(Equal(1))
+	})
 	DescribeTable("rejects malformed input", func(args []string) {
 		code, _, _ := execute(args...)
 		Expect(code).To(Equal(2))
@@ -92,7 +117,7 @@ var _ = Describe("Go tools command interface", func() {
 		code, _, stderr := execute("check", "--root="+root, "--iqn=iqn.test:owned", "--volume=pv-test")
 		Expect(code).To(Equal(2))
 		Expect(stderr).To(ContainSubstring("Cannot observe"))
-		for _, dir := range []string{"proc/1", "sys/class/block", "sys/class/iscsi_session/session1", "dev/disk/by-path"} {
+		for _, dir := range []string{"proc/1", "sys/class/block", "sys/class/iscsi_session/session1", "dev/disk/by-path", "var/run/iscsi.csi.k8s.io"} {
 			Expect(os.MkdirAll(filepath.Join(root, dir), 0755)).To(Succeed())
 		}
 		Expect(os.WriteFile(filepath.Join(root, "proc/1/mountinfo"), nil, 0600)).To(Succeed())

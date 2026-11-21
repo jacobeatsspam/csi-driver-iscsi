@@ -25,8 +25,10 @@ import (
 )
 
 var (
-	endpoint = flag.String("endpoint", "unix:///csi/csi.sock", "CSI endpoint")
-	nodeID   = flag.String("nodeid", "", "node id")
+	endpoint      = flag.String("endpoint", "unix:///csi/csi.sock", "CSI endpoint")
+	nodeID        = flag.String("nodeid", "", "node id")
+	mode          = flag.String("mode", "static", "process mode: static, node, or controller")
+	targetdConfig = flag.String("targetd-config", "", "targetd controller configuration file")
 )
 
 func init() {
@@ -40,6 +42,20 @@ func main() {
 }
 
 func handle() {
+	if *mode == "controller" {
+		d, err := iscsi.NewTargetdControllerDriver(*endpoint, *targetdConfig)
+		if err != nil {
+			klog.Fatal(err)
+		}
+		d.Run()
+		return
+	}
+	if *mode != "static" && *mode != "node" {
+		klog.Fatal("mode must be static, node, or controller")
+	}
 	d := iscsi.NewDriver(*nodeID, *endpoint)
+	if *mode == "node" {
+		d.EnableTargetdNode()
+	}
 	d.Run()
 }

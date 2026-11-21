@@ -142,3 +142,20 @@ func writeBtrfsDevices(t *testing.T, filesystems [][]string) string {
 	}
 	return root
 }
+
+func TestFindTargetMount(t *testing.T) {
+	infos := []mount.MountInfo{{MountPoint: "/target", Major: 8, Minor: 16, FsType: "ext4", MountOptions: []string{"ro"}}}
+	target, err := findTargetMount(infos, "/target", unix.Mkdev(8, 16))
+	if err != nil || target.Type != "ext4" || len(target.Opts) != 1 || target.Opts[0] != "ro" {
+		t.Fatalf("mounted target = %+v, %v", target, err)
+	}
+	if _, err := findTargetMount(infos, "/other", unix.Mkdev(8, 16)); err == nil {
+		t.Fatal("accepted a different target path")
+	}
+	if _, err := findTargetMount(infos, "/target", unix.Mkdev(8, 17)); err == nil {
+		t.Fatal("accepted a different device")
+	}
+	if _, err := findTargetMount(append(infos, infos[0]), "/target", unix.Mkdev(8, 16)); err == nil {
+		t.Fatal("accepted stacked mounts")
+	}
+}

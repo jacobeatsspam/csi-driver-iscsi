@@ -18,10 +18,12 @@ package iscsi
 
 import (
 	"context"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 	klog "k8s.io/klog/v2"
 )
 
@@ -48,11 +50,34 @@ func (ids *IdentityServer) GetPluginInfo(ctx context.Context, req *csi.GetPlugin
 }
 
 func (ids *IdentityServer) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeResponse, error) {
+	if c := ids.Driver.targetd; c != nil {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := c.checkBarrier(ctx); err != nil {
+			return &csi.ProbeResponse{Ready: wrapperspb.Bool(false)}, nil
+		}
+		pools, err := c.api.Pools(ctx)
+		ready := err == nil
+		for _, name := range c.pools {
+			found := false
+			for _, pool := range pools {
+				if pool.Name == name && pool.Type == "block" {
+					found = true
+					break
+				}
+			}
+			ready = ready && found
+		}
+		return &csi.ProbeResponse{Ready: wrapperspb.Bool(ready)}, nil
+	}
 	return &csi.ProbeResponse{}, nil
 }
 
 func (ids *IdentityServer) GetPluginCapabilities(ctx context.Context, req *csi.GetPluginCapabilitiesRequest) (*csi.GetPluginCapabilitiesResponse, error) {
 	klog.V(5).Infof("using default capabilities")
+	if ids.Driver.dynamicNode {
+		return &csi.GetPluginCapabilitiesResponse{}, nil
+	}
 
 	return &csi.GetPluginCapabilitiesResponse{
 		Capabilities: []*csi.PluginCapability{

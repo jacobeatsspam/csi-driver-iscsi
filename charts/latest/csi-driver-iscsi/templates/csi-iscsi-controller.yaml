@@ -1,0 +1,125 @@
+{{- if .Values.targetd.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: csi-iscsi-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{ include "iscsi.labels" . | indent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: csi-iscsi-controller
+  template:
+    metadata:
+      labels:
+        app: csi-iscsi-controller
+{{ include "iscsi.labels" . | indent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/config.yaml") . | sha256sum }}
+    spec:
+{{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | indent 8 }}
+{{- end }}
+      serviceAccountName: csi-iscsi-controller
+      nodeSelector:
+        kubernetes.io/os: linux
+{{- with (omit .Values.controller.nodeSelector "kubernetes.io/os") }}
+{{ toYaml . | indent 8 }}
+{{- end }}
+{{- with .Values.controller.affinity }}
+      affinity:
+{{ toYaml . | indent 8 }}
+{{- end }}
+{{- with .Values.controller.tolerations }}
+      tolerations:
+{{ toYaml . | indent 8 }}
+{{- end }}
+      priorityClassName: {{ .Values.controller.priorityClassName }}
+      containers:
+        - name: iscsi
+          image: {{ include "iscsi.image" (dict "baseRepo" .Values.image.baseRepo "image" .Values.image.iscsi) }}
+          imagePullPolicy: {{ .Values.image.iscsi.pullPolicy }}
+          args:
+            - --mode=controller
+            - --endpoint=unix:///csi/csi.sock
+            - --targetd-config=/etc/targetd/config.json
+            - --v=2
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 29754
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+            - name: config
+              mountPath: /etc/targetd
+              readOnly: true
+            - name: credentials
+              mountPath: /etc/targetd/credentials
+              readOnly: true
+            - name: ca
+              mountPath: /etc/targetd/ca
+              readOnly: true
+          resources: {{- toYaml .Values.controller.resources.iscsi | nindent 12 }}
+        - name: health-probe
+          image: {{ include "iscsi.image" (dict "baseRepo" .Values.image.baseRepo "image" .Values.image.livenessProbe) }}
+          imagePullPolicy: {{ .Values.image.livenessProbe.pullPolicy }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --probe-timeout=3s
+            - --health-port=29754
+            - --v=2
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+          resources: {{- toYaml .Values.controller.resources.livenessProbe | nindent 12 }}
+        - name: provisioner
+          image: {{ include "iscsi.image" (dict "baseRepo" .Values.image.baseRepo "image" .Values.image.csiProvisioner) }}
+          imagePullPolicy: {{ .Values.image.csiProvisioner.pullPolicy }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --timeout=60s
+            - --v=2
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+          resources: {{- toYaml .Values.controller.resources.csiProvisioner | nindent 12 }}
+        - name: attacher
+          image: {{ include "iscsi.image" (dict "baseRepo" .Values.image.baseRepo "image" .Values.image.csiAttacher) }}
+          imagePullPolicy: {{ .Values.image.csiAttacher.pullPolicy }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --timeout=60s
+            - --v=2
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+          resources: {{- toYaml .Values.controller.resources.csiAttacher | nindent 12 }}
+      volumes:
+        - name: socket
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: csi-targetd-config
+        - name: credentials
+          secret:
+            secretName: {{ required "targetd.existingSecret is required" .Values.targetd.existingSecret | quote }}
+            defaultMode: 0400
+        - name: ca
+          configMap:
+            name: {{ .Values.targetd.existingCAConfigMap | default "csi-targetd-ca" | quote }}
+            optional: {{ not .Values.targetd.existingCAConfigMap }}
+{{- end }}

@@ -21,8 +21,14 @@ package iscsi
 import (
 	"fmt"
 	"os"
+
+	"k8s.io/utils/mount"
 )
 
 func recoveryDeviceMounted(_ os.FileInfo) (bool, error) {
 	return false, fmt.Errorf("iSCSI device recovery is only supported on Linux")
+}
+
+func mountedTarget(_, _ string) (mount.MountPoint, error) {
+	return mount.MountPoint{}, fmt.Errorf("iSCSI device inspection is only supported on Linux")
 }

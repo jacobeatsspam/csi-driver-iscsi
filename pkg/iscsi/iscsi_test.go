@@ -92,3 +92,50 @@ func TestGetISCSIInfoInvalidPortals(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+func TestGetISCSIInfoPublishContext(t *testing.T) {
+	volume := map[string]string{"targetPortal": "10.0.0.1", "iqn": "iqn.test"}
+	for _, tc := range []struct {
+		name    string
+		publish map[string]string
+		valid   bool
+	}{
+		{"dynamic", map[string]string{"targetPortal": "10.0.0.1", "iqn": "iqn.test", "lun": "4"}, true},
+		{"equivalent default port", map[string]string{"targetPortal": "10.0.0.1:3260", "lun": "4"}, true},
+		{"conflicting target", map[string]string{"targetPortal": "10.0.0.2", "lun": "4"}, false},
+		{"negative lun", map[string]string{"lun": "-1"}, false},
+		{"overflow lun", map[string]string{"lun": "16384"}, false},
+		{"empty portal", map[string]string{"targetPortal": ":3260", "lun": "4"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := getISCSIInfo(&csi.NodePublishVolumeRequest{VolumeId: "vol", VolumeContext: volume, PublishContext: tc.publish})
+			if (err == nil) != tc.valid {
+				t.Fatalf("getISCSIInfo: %v", err)
+			}
+		})
+	}
+	info, err := getISCSIInfo(&csi.NodePublishVolumeRequest{VolumeId: "vol", VolumeContext: volume, PublishContext: map[string]string{"lun": "4", "initiatorName": "iqn.1993-08.org.debian:node", "volumeUUID": "aabb-ccdd"}})
+	if err != nil || !info.discovery {
+		t.Fatalf("dynamic volume must discover target: %v", err)
+	}
+	if _, err := getISCSIInfo(&csi.NodePublishVolumeRequest{VolumeId: "../vol", VolumeContext: map[string]string{"targetPortal": "host", "iqn": "iqn.test", "lun": "0"}}); err == nil {
+		t.Fatal("accepted unsafe volume ID")
+	}
+}
+
+func TestLegacySecretsSuppressRPCPayloadLogs(t *testing.T) {
+	legacy := map[string]string{"secret": "legacy CHAP credentials"}
+	for _, req := range []interface{}{
+		&csi.NodePublishVolumeRequest{VolumeContext: legacy},
+		&csi.NodePublishVolumeRequest{PublishContext: legacy},
+		&csi.ValidateVolumeCapabilitiesRequest{VolumeContext: legacy},
+		&csi.CreateVolumeRequest{Parameters: legacy},
+	} {
+		if !hasLegacySecret(req) {
+			t.Fatalf("legacy credentials would appear in the %T log", req)
+		}
+	}
+	if hasLegacySecret(&csi.NodePublishVolumeRequest{VolumeContext: map[string]string{"lun": "0"}}) {
+		t.Fatal("suppressed ordinary request diagnostics")
+	}
+}

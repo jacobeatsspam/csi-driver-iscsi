@@ -206,6 +206,10 @@ func (f *fixture) exec(ctx context.Context, ns, pod, container string, args []st
 			return "", "", nil
 		}
 		return "sdb\n", "", nil
+	case "logout-fixture":
+		if f.mode == "logout-failed" {
+			return "", "", fmt.Errorf("logout failed")
+		}
 	case "check", "check-lun":
 		if f.mode == "validator-replaced" {
 			object, err := f.client.Tracker().Get(v1.SchemeGroupVersion.WithResource("pods"), ns, pod)
@@ -399,6 +403,7 @@ var _ = Describe("Typed Kubernetes lifecycle", func() {
 		f.h.Config.TeardownTimeout = 100 * time.Millisecond
 		f.mode = mode
 		Expect(f.h.Cleanup(context.Background())).NotTo(Succeed())
+		Expect(f.calls).NotTo(ContainElement("exec:logout-fixture"))
 		for _, resource := range []string{"namespaces", "persistentvolumes", "persistentvolumeclaims", "deployments", "daemonsets", "csidrivers"} {
 			for _, action := range f.client.Actions() {
 				Expect(action.GetVerb() == "delete" && action.GetResource().Resource == resource).To(BeFalse(), "deleted supporting resource %s", resource)
@@ -513,7 +518,7 @@ var _ = Describe("Typed Kubernetes lifecycle", func() {
 		Expect(f.h.Baseline(context.Background())).NotTo(Succeed())
 		f.mode = "unobservable"
 		Expect(f.h.Cleanup(context.Background())).NotTo(Succeed())
-		Expect(f.calls).To(ContainElement("exec:snapshot"))
+		Expect(f.calls).To(ContainElement("exec:snapshot-lun"))
 	})
 	It("rejects a validator replacement during a successful probe", func() {
 		f := newFixture()

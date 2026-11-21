@@ -1,0 +1,3 @@
+Check the driver pods with:
+
+  kubectl --namespace={{ .Release.Namespace }} get pods --selector="app.kubernetes.io/instance={{ .Release.Name }}"

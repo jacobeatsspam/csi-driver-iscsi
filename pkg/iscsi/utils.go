@@ -59,14 +59,30 @@ func ParseEndpoint(ep string) (string, string, error) {
 	return "", "", fmt.Errorf("invalid endpoint: %v", ep)
 }
 
+// Legacy static PVs put CHAP credentials in unmarked CSI map fields.
+func hasLegacySecret(req interface{}) bool {
+	if attrs, ok := req.(interface{ GetVolumeContext() map[string]string }); ok && attrs.GetVolumeContext()["secret"] != "" {
+		return true
+	}
+	if attrs, ok := req.(interface{ GetPublishContext() map[string]string }); ok && attrs.GetPublishContext()["secret"] != "" {
+		return true
+	}
+	attrs, ok := req.(interface{ GetParameters() map[string]string })
+	return ok && attrs.GetParameters()["secret"] != ""
+}
+
 func logGRPC(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 	klog.V(3).Infof("GRPC call: %s", info.FullMethod)
-	klog.V(5).Infof("GRPC request: %s", protosanitizer.StripSecrets(req))
+	debug := klog.V(5)
+	logPayload := debug.Enabled() && !hasLegacySecret(req)
+	if logPayload {
+		debug.Infof("GRPC request: %s", protosanitizer.StripSecrets(req))
+	}
 	resp, err := handler(ctx, req)
 	if err != nil {
 		klog.Errorf("GRPC error: %v", err)
-	} else {
-		klog.V(5).Infof("GRPC response: %s", protosanitizer.StripSecrets(resp))
+	} else if logPayload {
+		debug.Infof("GRPC response: %s", protosanitizer.StripSecrets(resp))
 	}
 	return resp, err
 }

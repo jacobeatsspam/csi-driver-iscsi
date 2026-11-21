@@ -17,6 +17,12 @@ set -euo pipefail
 
 cluster=${E2E_KIND_CLUSTER:-kind}
 node="${cluster}-control-plane"
+if [ ! -d /sys/class/iscsi_session ] ||
+   ! sessions=$(ls -A /sys/class/iscsi_session) || [ -n "$sessions" ] ||
+   [ "$(systemctl show iscsid.service --property=ActiveState --value)" != inactive ]; then
+    echo 'Host iscsid is active or iSCSI session state is not empty and observable; refusing kind setup.' >&2
+    exit 1
+fi
 kind create cluster --name "$cluster" --wait 120s
 docker exec "$node" bash -c '
     set -e
@@ -39,7 +45,7 @@ docker exec "$node" bash -c '
     mkdir -p /run/lock
 '
 node_pid=$(docker inspect --format '{{.State.Pid}}' "$node")
-docker run -d --name "${cluster}-iscsid" --privileged --pid=host \
+docker run -d --name "${cluster}-iscsid" --label "iscsi.csi.k8s.io/e2e-kind-iscsid=$cluster" --privileged --pid=host \
 	--network "container:$node" -e "NODE_PID=$node_pid" --entrypoint python3 \
 	python:3.13.12-alpine3.23@sha256:bb1f2fdb1065c85468775c9d680dcd344f6442a2d1181ef7916b60a623f11d40 \
 	-c "$(cat test/utils/kind-iscsid.py)"

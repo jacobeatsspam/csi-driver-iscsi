@@ -1,5 +1,6 @@
 name: Ubuntu E2E tests
 on:
+  workflow_call: {}
   push:
     branches: [ master ]
   pull_request:
@@ -7,7 +8,7 @@ on:
 
 jobs:
   e2e:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out code into the Go module directory
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -20,6 +21,7 @@ jobs:
 
       - name: Install kind and prepare the host
         run: |
+          bash test/e2e/install-kubectl.sh
           go install sigs.k8s.io/kind@v0.33.0
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           if [ ! -d /sys/class/iscsi_transport/tcp ]; then
@@ -31,10 +33,13 @@ jobs:
           fi
 
       - name: e2e tests
+        env:
+          E2E_DISPOSABLE_VM: '1'
         run: |
           make deploy-kind
-          make
+          make iscsi
           make e2e-test
+          make e2e-targetd-test
 
       - name: Tear down kind
         if: ${{ !cancelled() }}

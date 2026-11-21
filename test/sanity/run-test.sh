@@ -14,66 +14,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -eo pipefail
+set -euo pipefail
 
-function cleanup {
-  echo 'pkill -f iscsiplugin'
-  if [ -z "$GITHUB_ACTIONS" ]
-  then
-    # if not running on github actions, do not use sudo
-    pkill -f iscsiplugin
-  else
-    # if running on github actions, use sudo
-    sudo pkill -f iscsiplugin
+work=$(mktemp -d)
+driver_pid=
+runner=()
+if [[ -n ${GITHUB_ACTIONS:-} ]]; then
+  runner=(sudo)
+fi
+
+cleanup() {
+  if [[ -n $driver_pid ]]; then
+    "${runner[@]}" kill "$driver_pid" 2>/dev/null || true
+    wait "$driver_pid" 2>/dev/null || true
   fi
-  echo 'Deleting CSI sanity test binary'
-  rm -rf csi-test
+  "${runner[@]}" rm -rf --one-file-system -- "$work"
 }
-
 trap cleanup EXIT
 
-function install_csi_sanity_bin {
-  echo 'Installing CSI sanity test binary...'
-  mkdir -p $GOPATH/src/github.com/kubernetes-csi
-  pushd $GOPATH/src/github.com/kubernetes-csi
-  export GO111MODULE=on
-  git clone https://github.com/kubernetes-csi/csi-test.git -b v5.6.0
-  pushd csi-test/cmd/csi-sanity
-  make install
-  popd
-  popd
-}
-
-if [[ -z "$(command -v csi-sanity)" ]]; then
-	install_csi_sanity_bin
+if ! sanity_bin=$(command -v csi-sanity); then
+  sanity_bin="$(go env GOPATH)/bin/csi-sanity"
+  if [[ ! -x $sanity_bin ]]; then
+    GOBIN="$work" go install github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@v5.6.0
+    sanity_bin="$work/csi-sanity"
+  fi
 fi
 
-readonly endpoint='unix:///tmp/csi.sock'
-nodeid='CSINode'
-if [[ "$#" -gt 0 ]] && [[ -n "$1" ]]; then
-  nodeid="$1"
-fi
+CSI_SANITY_BIN="$sanity_bin" go test -mod=vendor -count=1 -v ./pkg/iscsi -run '^TestTargetdControllerSanity$'
 
-ARCH=${ARCH:-amd64}
+endpoint="unix://$work/csi.sock"
+"${runner[@]}" "bin/${ARCH:-amd64}/iscsiplugin" --endpoint "$endpoint" --nodeid "${1:-CSINode}" -v=5 &
+driver_pid=$!
 
-if [ -z "$GITHUB_ACTIONS" ]
-then
-  # if not running on github actions, do not use sudo
-  "bin/${ARCH}/iscsiplugin" --endpoint "$endpoint" --nodeid "$nodeid" -v=5 &
-else
-  # if running on github actions, use sudo
-  sudo "bin/${ARCH}/iscsiplugin" --endpoint "$endpoint" --nodeid "$nodeid" -v=5 &
-fi
-
-echo 'Begin to run sanity test...'
 # shortcut: csi-test v5.6.0 panics on skipped group snapshots, remove after upgrading.
 skipTests='Controller Server|GroupController VolumeGroupSnapshots|should work|should be idempotent|should remove target path'
-CSI_SANITY_BIN=$GOPATH/bin/csi-sanity
-if [ -z "$GITHUB_ACTIONS" ]
-then
-  # if not running on github actions, do not use sudo
-  "$CSI_SANITY_BIN" --ginkgo.v --csi.secrets="$(pwd)/test/sanity/secrets.yaml" --csi.testvolumeparameters="$(pwd)/test/sanity/params.yaml" --csi.endpoint="$endpoint" --ginkgo.skip="$skipTests"
-else
-  # if running on github actions, use sudo
-  sudo "$CSI_SANITY_BIN" --ginkgo.v --csi.secrets="$(pwd)/test/sanity/secrets.yaml" --csi.testvolumeparameters="$(pwd)/test/sanity/params.yaml" --csi.endpoint="$endpoint" --ginkgo.skip="$skipTests"
-fi
+"${runner[@]}" "$sanity_bin" --ginkgo.v \
+  --csi.secrets="$PWD/test/sanity/secrets.yaml" --csi.testvolumeparameters="$PWD/test/sanity/params.yaml" \
+  --csi.endpoint="$endpoint" --csi.mountdir="$work/mount" --csi.stagingdir="$work/stage" --ginkgo.skip="$skipTests"

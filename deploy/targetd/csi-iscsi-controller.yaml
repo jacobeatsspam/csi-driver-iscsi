@@ -1,0 +1,206 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: csi-iscsi-controller
+  namespace: kube-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: csi-iscsi-targetd-barrier
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: csi-iscsi-targetd-barrier
+  namespace: kube-system
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["csi-iscsi-targetd-barrier"]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: csi-iscsi-targetd-barrier
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: csi-iscsi-targetd-barrier
+subjects:
+  - kind: ServiceAccount
+    name: csi-iscsi-controller
+    namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: csi-iscsi-controller
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments/status"]
+    verbs: ["patch"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots", "volumesnapshotcontents"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: csi-iscsi-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: csi-iscsi-controller
+subjects:
+  - kind: ServiceAccount
+    name: csi-iscsi-controller
+    namespace: kube-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: csi-iscsi-controller
+  namespace: kube-system
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: csi-iscsi-controller
+  template:
+    metadata:
+      labels:
+        app: csi-iscsi-controller
+    spec:
+      serviceAccountName: csi-iscsi-controller
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: iscsi
+          image: gcr.io/k8s-staging-sig-storage/iscsiplugin:canary
+          imagePullPolicy: IfNotPresent
+          args:
+            - --mode=controller
+            - --endpoint=unix:///csi/csi.sock
+            - --targetd-config=/etc/targetd/config.json
+            - --v=2
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 29754
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+            - name: config
+              mountPath: /etc/targetd
+              readOnly: true
+            - name: credentials
+              mountPath: /etc/targetd/credentials
+              readOnly: true
+            - name: ca
+              mountPath: /etc/targetd/ca
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 20Mi
+            limits:
+              memory: 300Mi
+        - name: health-probe
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.20.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --probe-timeout=3s
+            - --health-port=29754
+            - --v=2
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+          resources:
+            requests:
+              cpu: 10m
+              memory: 20Mi
+            limits:
+              memory: 100Mi
+        - name: provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v5.2.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --timeout=60s
+            - --v=2
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+          resources:
+            requests:
+              cpu: 10m
+              memory: 20Mi
+            limits:
+              memory: 200Mi
+        - name: attacher
+          image: registry.k8s.io/sig-storage/csi-attacher:v4.8.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --timeout=60s
+            - --v=2
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+          resources:
+            requests:
+              cpu: 10m
+              memory: 20Mi
+            limits:
+              memory: 200Mi
+      volumes:
+        - name: socket
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: csi-targetd-config
+        - name: credentials
+          secret:
+            secretName: csi-targetd-credentials
+            defaultMode: 0400
+        - name: ca
+          configMap:
+            name: csi-targetd-ca
+            optional: true

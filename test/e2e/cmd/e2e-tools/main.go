@@ -24,6 +24,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -40,6 +41,44 @@ func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 
 var dialTarget = func(ctx context.Context, budget time.Duration, address string) (net.Conn, error) {
 	return (&net.Dialer{Timeout: budget}).DialContext(ctx, "tcp", address)
+}
+
+var logoutTarget = func(ctx context.Context, root, iqn string) error {
+	cmd := exec.CommandContext(ctx, "/sbin/iscsiadm", "-m", "node", "-T", iqn, "--logout")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Chroot: root}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("logout: %w: %s", err, output)
+	}
+	return nil
+}
+
+// logoutFixture only logs out the unique target created by this test run.
+func logoutFixture(ctx context.Context, root, iqn string) error {
+	const prefix = "iqn.2026-01.com.test:storage-"
+	if !strings.HasPrefix(iqn, prefix) || len(iqn) == len(prefix) || strings.ContainsAny(iqn, "/ \t\r\n") {
+		return errors.New("invalid fixture target IQN")
+	}
+	sessions, err := os.ReadDir(filepath.Join(root, "sys/class/iscsi_session"))
+	if err != nil {
+		return err
+	}
+	for _, session := range sessions {
+		if !strings.HasPrefix(session.Name(), "session") {
+			continue
+		}
+		identity, err := os.ReadFile(filepath.Join(root, "sys/class/iscsi_session", session.Name(), "targetname"))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(string(identity)) == iqn {
+			return logoutTarget(ctx, root, iqn)
+		}
+	}
+	return nil
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
@@ -98,6 +137,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if err == nil && len(devices) > 0 {
 			_, err = fmt.Fprintln(stdout, strings.Join(devices, "\n"))
 		}
+	case "logout-fixture":
+		err = logoutFixture(ctx, *root, *iqn)
 	case "seed", "verify":
 		if *path == "" {
 			_, _ = fmt.Fprintln(stderr, "--path is required")

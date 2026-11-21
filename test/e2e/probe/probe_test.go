@@ -109,9 +109,10 @@ var _ = Describe("Volume teardown observations", func() {
 	var options probe.VolumeOptions
 	BeforeEach(func() {
 		root = GinkgoT().TempDir()
-		for _, path := range []string{"proc/1", "proc/self", "sys/class/block", "sys/class/iscsi_session", "dev/disk/by-path"} {
+		for _, path := range []string{"proc/1", "proc/self", "sys/class/block", "sys/class/iscsi_session", "dev/disk/by-path", "run/iscsi.csi.k8s.io", "var"} {
 			mkdir(filepath.Join(root, path))
 		}
+		Expect(os.Symlink("/run", filepath.Join(root, "var/run"))).To(Succeed())
 		write(filepath.Join(root, "proc/1/mountinfo"), "")
 		write(filepath.Join(root, "proc/self/mountinfo"), "")
 		options = probe.VolumeOptions{Root: root, IQN: iqn, Volume: volume}
@@ -149,6 +150,33 @@ var _ = Describe("Volume teardown observations", func() {
 		session("session1", iqn, "sdb", "1")
 		expectCode(check("check"), 1)
 		Expect(filepath.Join(root, "sys/class/block/sdz")).To(BeADirectory())
+	})
+	It("waits for the connector record while permitting an active target session", func() {
+		session("session1", iqn, "sdb", "1")
+		Expect(os.Remove(filepath.Join(root, "sys/class/block/sdb"))).To(Succeed())
+		options.LUN = "1"
+		options.Tracked = []string{"sdb"}
+		path := filepath.Join(root, "run/iscsi.csi.k8s.io/iscsi-"+volume+".json")
+		write(path, "pending")
+		expectCode(check("check-lun"), 1)
+		Expect(os.Remove(path)).To(Succeed())
+		Expect(check("check-lun")).To(Succeed())
+		Expect(filepath.Join(root, "sys/class/iscsi_session/session1/targetname")).To(BeAnExistingFile())
+	})
+	It("fails closed when the driver run directory is missing", func() {
+		Expect(os.RemoveAll(filepath.Join(root, "run/iscsi.csi.k8s.io"))).To(Succeed())
+		options.LUN = "1"
+		expectCode(check("check-lun"), 2)
+	})
+	It("uses a host /var/run directory when it is not a symlink", func() {
+		Expect(os.Remove(filepath.Join(root, "var/run"))).To(Succeed())
+		mkdir(filepath.Join(root, "var/run/iscsi.csi.k8s.io"))
+		options.LUN = "1"
+		path := filepath.Join(root, "var/run/iscsi.csi.k8s.io/iscsi-"+volume+".json")
+		write(path, "pending")
+		expectCode(check("check-lun"), 1)
+		Expect(os.Remove(path)).To(Succeed())
+		Expect(check("check-lun")).To(Succeed())
 	})
 	It("detects broken by-path symlinks even after session removal", func() {
 		path := filepath.Join(root, "dev/disk/by-path/ip-127.0.0.1-iscsi-"+iqn+"-lun-1")

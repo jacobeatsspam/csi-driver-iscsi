@@ -31,22 +31,37 @@ type ControllerServer struct {
 }
 
 func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
+	if cs.Driver.targetd != nil {
+		return cs.Driver.targetd.createVolume(ctx, req)
+	}
 	return nil, status.Error(codes.Unimplemented, "")
 }
 
 func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
+	if cs.Driver.targetd != nil {
+		return cs.Driver.targetd.deleteVolume(ctx, req)
+	}
 	return nil, status.Error(codes.Unimplemented, "")
 }
 
 func (cs *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
+	if cs.Driver.targetd != nil {
+		return cs.Driver.targetd.publishVolume(ctx, req)
+	}
 	return nil, status.Error(codes.Unimplemented, "")
 }
 
 func (cs *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
+	if cs.Driver.targetd != nil {
+		return cs.Driver.targetd.unpublishVolume(ctx, req)
+	}
 	return nil, status.Error(codes.Unimplemented, "")
 }
 
 func (cs *ControllerServer) ValidateVolumeCapabilities(ctx context.Context, req *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
+	if cs.Driver.targetd != nil {
+		return cs.Driver.targetd.validateVolume(ctx, req)
+	}
 	return nil, status.Error(codes.Unimplemented, "")
 }
 

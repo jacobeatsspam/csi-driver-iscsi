@@ -74,6 +74,7 @@ sanity-test: iscsi
 unit-test:
 	mkdir -p bin
 	go test -mod=vendor -v -race -coverprofile=bin/profile.cov ./pkg/...
+	go test -mod=vendor -v ./test/helm/...
 
 .PHONY: verify
 verify: unit-test
@@ -90,7 +91,7 @@ clean:
 
 .PHONY: deploy-kind
 deploy-kind:
-	test/utils/deploy-kind.sh
+	bash test/e2e/with-iscsid-isolation.sh --lock-only test/utils/deploy-kind.sh
 
 # Check the code that sets up and runs the e2e tests without a cluster.
 .PHONY: e2e-unit
@@ -103,24 +104,24 @@ e2e-fixture-test:
 	go build -mod=vendor -o bin/e2e-fixture-test ./test/e2e/cmd/fixture-integration
 	./bin/e2e-fixture-test
 
+# Run the main suite of e2e tests that aren't dependent upon kernel wide LVM state.
 .PHONY: e2e-test
 e2e-test: e2e-unit e2e-fixture-test
-	go test -mod=vendor -tags=e2e -timeout=0 -v ./test/e2e $(GINKGO_FLAGS)
+	bash test/e2e/with-iscsid-isolation.sh go test -mod=vendor -tags=e2e -timeout=0 -v ./test/e2e $(GINKGO_FLAGS)
+
+# Targetd uses kernel-wide LVM and LIO state, so this only works within a dedicated VM.
+.PHONY: e2e-targetd-test
+e2e-targetd-test:
+	bash test/e2e/targetd/run.sh
+
+# Create a disposable VM and run the PR workflow with act inside it.
+.PHONY: local-act-e2e
+local-act-e2e:
+	bash test/e2e/local-act-e2e.sh
 
 .PHONY: e2e-teardown
 e2e-teardown:
-	@if docker inspect "$(E2E_KIND_CLUSTER)-control-plane" >/dev/null 2>&1; then \
-		sessions=$$(docker exec "$(E2E_KIND_CLUSTER)-control-plane" ls -A /sys/class/iscsi_session) || exit 1; \
-		if [ -n "$$sessions" ]; then \
-			echo 'Active iSCSI sessions remain; refusing to delete the cluster.' >&2; exit 1; \
-		fi; \
-		mounts=$$(docker exec "$(E2E_KIND_CLUSTER)-control-plane" awk '/\/volumes\/kubernetes.io~csi\/iscsi-pv-/ {print}' /proc/1/mountinfo) || exit 1; \
-		if [ -n "$$mounts" ]; then \
-			echo 'Test volume mounts remain; refusing to delete the cluster.' >&2; exit 1; \
-		fi; \
-	fi
-	docker rm -f "$(E2E_KIND_CLUSTER)-iscsid" 2>/dev/null || true
-	kind delete cluster --name "$(E2E_KIND_CLUSTER)"
+	bash test/e2e/with-iscsid-isolation.sh --lock-only test/utils/teardown-kind.sh
 
 .PHONY: install-iscsi-server
 install-iscsi-server:

@@ -89,10 +89,18 @@ func PrerequisitesOS(root, osName string) error {
 // Resolve host absolute symlinks relative to the mounted host root, rather than
 // accidentally consulting a similarly named program inside the probe image.
 func hostExecutable(root, relative string) bool {
+	path, err := hostPath(root, relative)
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0111 != 0
+}
+
+func hostPath(root, relative string) (string, error) {
 	pending := strings.Split(filepath.ToSlash(relative), "/")
 	resolved := []string{}
 	links := 0
-	var info os.FileInfo
 	for len(pending) > 0 {
 		part := pending[0]
 		pending = pending[1:]
@@ -106,19 +114,18 @@ func hostExecutable(root, relative string) bool {
 			continue
 		}
 		path := filepath.Join(append([]string{root}, append(resolved, part)...)...)
-		var err error
-		info, err = os.Lstat(path)
+		info, err := os.Lstat(path)
 		if err != nil {
-			return false
+			return "", err
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
 			links++
 			if links > 40 {
-				return false
+				return "", errors.New("too many host symlinks")
 			}
 			target, err := os.Readlink(path)
 			if err != nil {
-				return false
+				return "", err
 			}
 			if filepath.IsAbs(target) {
 				resolved = nil
@@ -128,7 +135,7 @@ func hostExecutable(root, relative string) bool {
 			resolved = append(resolved, part)
 		}
 	}
-	return info != nil && info.Mode().IsRegular() && info.Mode().Perm()&0111 != 0
+	return filepath.Join(append([]string{root}, resolved...)...), nil
 }
 
 var safeName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
@@ -237,6 +244,20 @@ func Volume(mode string, options VolumeOptions) ([]string, error) {
 	}
 	if mounted {
 		residual = append(residual, "Run publication mount remains in node mount namespace")
+	}
+	runDir, err := hostPath(root, "var/run/iscsi.csi.k8s.io")
+	if err != nil {
+		return nil, observationError("Cannot observe driver run directory")
+	}
+	entries, err := os.ReadDir(runDir)
+	if err != nil {
+		return nil, observationError("Cannot observe driver run directory")
+	}
+	record := "iscsi-" + options.Volume + ".json"
+	for _, entry := range entries {
+		if entry.Name() == record {
+			residual = append(residual, "Run connector record remains on node")
+		}
 	}
 	paths, err := os.ReadDir(filepath.Join(root, "dev/disk/by-path"))
 	if err != nil {

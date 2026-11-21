@@ -1,0 +1,22 @@
+{{- if .Values.targetd.enabled }}
+{{- $config := dict
+  "backendID" (required "targetd.backendID is required" .Values.targetd.backendID)
+  "endpoint" (required "targetd.endpoint is required" .Values.targetd.endpoint)
+  "pools" (required "targetd.pools is required" .Values.targetd.pools)
+  "namespace" (required "targetd.namespace is required" .Values.targetd.namespace)
+  "targetIQN" (required "targetd.targetIQN is required" .Values.targetd.targetIQN)
+  "portals" (required "targetd.portals is required" .Values.targetd.portals)
+  "username" (required "targetd.username is required" .Values.targetd.username)
+  "passwordFile" "/etc/targetd/credentials/password"
+}}
+{{- if .Values.targetd.existingCAConfigMap }}
+{{- $_ := set $config "caFile" "/etc/targetd/ca/ca.crt" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: csi-targetd-config
+  namespace: {{ .Release.Namespace }}
+data:
+  config.json: {{ $config | toJson | quote }}
+{{- end }}

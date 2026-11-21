@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	v1 "k8s.io/api/core/v1"
@@ -30,6 +31,11 @@ import (
 type validatorState struct {
 	Pod     v1.Pod
 	Devices string
+}
+
+type cleanupVolume struct {
+	name, lun string
+	states    []validatorState
 }
 
 func deletion(object metav1.Object) metav1.DeleteOptions {
@@ -237,29 +243,55 @@ func (h *Harness) Cleanup(_ context.Context) error {
 		}
 		return nil
 	}
-	var states []validatorState
+	var volumes []cleanupVolume
 	if h.published {
-		states, err = h.snapshot(ctx, "snapshot", h.name("iscsi-pv"), "")
-		if err != nil {
-			return fmt.Errorf("cannot snapshot node devices; retaining supporting resources: %w", err)
+		fmt.Fprintln(os.Stderr, "e2e cleanup: capture fixture device state")
+		volumes = append(volumes, cleanupVolume{name: h.name("iscsi-pv"), lun: "1"})
+		if h.Config.LUNCount == 2 {
+			volumes = append(volumes, cleanupVolume{name: h.name("iscsi-pv-b"), lun: "2"})
+		}
+		for i := range volumes {
+			volumes[i].states, err = h.snapshot(ctx, "snapshot-lun", volumes[i].name, volumes[i].lun)
+			if err != nil {
+				return fmt.Errorf("cannot snapshot node devices; retaining supporting resources: %w", err)
+			}
 		}
 	}
+	fmt.Fprintln(os.Stderr, "e2e cleanup: delete fixture workload pods")
 	for _, prefix := range []string{"iscsi-pod", "iscsi-pod-b", "iscsi-check"} {
 		if err = h.deletePod(ctx, h.name(prefix), true); err != nil {
 			return fmt.Errorf("workload deletion failed; retaining supporting resources: %w", err)
 		}
 	}
 	if h.published {
-		volumes := []string{h.name("iscsi-pv")}
-		if h.Config.LUNCount == 2 {
-			volumes = append(volumes, h.name("iscsi-pv-b"))
-		}
+		fmt.Fprintln(os.Stderr, "e2e cleanup: wait for fixture mounts, connector records, and LUN devices to disappear")
 		for _, volume := range volumes {
-			if err = h.poll(ctx, func(ctx context.Context) (bool, error) { return h.observedClean(ctx, states, "check", volume, "") }); err != nil {
+			if err = h.poll(ctx, func(ctx context.Context) (bool, error) {
+				return h.observedClean(ctx, volume.states, "check-lun", volume.name, volume.lun)
+			}); err != nil {
+				return fmt.Errorf("cannot verify fixture LUN teardown: %w", err)
+			}
+		}
+		fmt.Fprintln(os.Stderr, "e2e cleanup: log out fixture iSCSI sessions")
+		for _, state := range volumes[0].states {
+			current, getErr := h.Client.CoreV1().Pods(h.Config.Namespace).Get(ctx, state.Pod.Name, metav1.GetOptions{})
+			if getErr != nil || current.UID != state.Pod.UID || !h.owned(current.Labels) || !readyPod(current) {
+				return fmt.Errorf("node validator changed before fixture logout")
+			}
+			if _, err = h.exec(ctx, state.Pod.Name, "prerequisites", "/e2e-tools", "logout-fixture", "--root=/host", "--iqn="+h.Config.IQN); err != nil {
+				return fmt.Errorf("fixture logout failed; retaining resources: %w", err)
+			}
+		}
+		fmt.Fprintln(os.Stderr, "e2e cleanup: verify fixture devices and sessions are gone")
+		for _, volume := range volumes {
+			if err = h.poll(ctx, func(ctx context.Context) (bool, error) {
+				return h.observedClean(ctx, volume.states, "check", volume.name, "")
+			}); err != nil {
 				return fmt.Errorf("node teardown failed; retaining target, driver, claims and namespace: %w", err)
 			}
 		}
 	}
+	fmt.Fprintln(os.Stderr, "e2e cleanup: remove fixture resources")
 	if err = h.removeSupportingResources(ctx); err != nil {
 		return err
 	}

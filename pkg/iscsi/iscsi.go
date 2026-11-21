@@ -19,6 +19,8 @@ package iscsi
 import (
 	"encoding/json"
 	"fmt"
+	"net"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -32,14 +34,44 @@ import (
 
 func getISCSIInfo(req *csi.NodePublishVolumeRequest) (*iscsiDisk, error) {
 	volName := req.GetVolumeId()
-	tp := req.GetVolumeContext()["targetPortal"]
-	iqn := req.GetVolumeContext()["iqn"]
-	lun := req.GetVolumeContext()["lun"]
+	if !validVolumeID(volName) {
+		return nil, fmt.Errorf("invalid volume ID")
+	}
+	params := make(map[string]string, len(req.GetVolumeContext())+len(req.GetPublishContext()))
+	for key, value := range req.GetVolumeContext() {
+		params[key] = value
+	}
+	for key, value := range req.GetPublishContext() {
+		if old, ok := params[key]; ok && old != "" && value != "" && old != value {
+			equal := false
+			if key == "targetPortal" {
+				oldPortal, oldErr := validatePortal(old)
+				newPortal, newErr := validatePortal(value)
+				equal = oldErr == nil && newErr == nil && oldPortal == newPortal
+			} else if key == "lun" {
+				oldLUN, oldErr := strconv.ParseUint(old, 10, 14)
+				newLUN, newErr := strconv.ParseUint(value, 10, 14)
+				equal = oldErr == nil && newErr == nil && oldLUN == newLUN
+			}
+			if !equal {
+				return nil, fmt.Errorf("conflicting %s in volume and publish context", key)
+			}
+		}
+		if value != "" {
+			params[key] = value
+		}
+	}
+	tp := params["targetPortal"]
+	iqn := params["iqn"]
+	lun := params["lun"]
 	if tp == "" || iqn == "" || lun == "" {
 		return nil, fmt.Errorf("ISCSI target information is missing")
 	}
+	if strings.ContainsAny(iqn, " /\\\t\r\n*?[]") {
+		return nil, fmt.Errorf("invalid iSCSI target name")
+	}
 
-	secretParams := req.GetVolumeContext()["secret"]
+	secretParams := params["secret"]
 	secret := parseSecret(secretParams)
 	sessionSecret, err := parseSessionSecret(secret)
 	if err != nil {
@@ -50,9 +82,13 @@ func getISCSIInfo(req *csi.NodePublishVolumeRequest) (*iscsiDisk, error) {
 		return nil, err
 	}
 
-	bkportal := []string{portalMounter(tp)}
+	primary, err := validatePortal(tp)
+	if err != nil {
+		return nil, err
+	}
+	bkportal := []string{primary}
 
-	portalList := req.GetVolumeContext()["portals"]
+	portalList := params["portals"]
 	if len(portalList) > 0 {
 		portals := []string{}
 		if err := json.Unmarshal([]byte(portalList), &portals); err != nil {
@@ -61,24 +97,32 @@ func getISCSIInfo(req *csi.NodePublishVolumeRequest) (*iscsiDisk, error) {
 
 		for _, portal := range portals {
 			// Skip duplicates so the same portal is not logged into twice.
-			if portal = portalMounter(portal); !slices.Contains(bkportal, portal) {
+			portal, err = validatePortal(portal)
+			if err != nil {
+				return nil, err
+			}
+			if !slices.Contains(bkportal, portal) {
 				bkportal = append(bkportal, portal)
 			}
 		}
 	}
 
-	iface := req.GetVolumeContext()["iscsiInterface"]
-	initiatorName := req.GetVolumeContext()["initiatorName"]
-	chapDiscovery := req.GetVolumeContext()["discoveryCHAPAuth"] == "true"
-	chapSession := req.GetVolumeContext()["sessionCHAPAuth"] == "true"
+	iface := params["iscsiInterface"]
+	initiatorName := params["initiatorName"]
+	volumeUUID := req.GetPublishContext()["volumeUUID"]
+	if (req.GetPublishContext()["initiatorName"] != "" || volumeUUID != "") && (req.GetPublishContext()["initiatorName"] == "" || !safeTargetdID.MatchString(volumeUUID)) {
+		return nil, fmt.Errorf("dynamic volume UUID is missing or invalid")
+	}
+	chapDiscovery := params["discoveryCHAPAuth"] == "true"
+	chapSession := params["sessionCHAPAuth"] == "true"
 
-	doDiscovery := req.GetVolumeContext()["discovery"] == "true"
+	doDiscovery := params["discovery"] == "true" || req.GetPublishContext()["initiatorName"] != ""
 
 	var lunVal int32
 	if lun != "" {
-		l, err := strconv.Atoi(lun)
+		l, err := strconv.ParseUint(lun, 10, 14)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("invalid LUN %q", lun)
 		}
 		lunVal = int32(l)
 	}
@@ -96,9 +140,14 @@ func getISCSIInfo(req *csi.NodePublishVolumeRequest) (*iscsiDisk, error) {
 		sessionSecret:   sessionSecret,
 		discoverySecret: discoverySecret,
 		InitiatorName:   initiatorName,
+		volumeUUID:      volumeUUID,
 	}
 
 	return iscsiDisk, nil
+}
+
+func validVolumeID(id string) bool {
+	return id != "" && id != "." && id != ".." && filepath.Base(id) == id
 }
 
 func buildISCSIConnector(iscsiInfo *iscsiDisk) *iscsiLib.Connector {
@@ -107,6 +156,7 @@ func buildISCSIConnector(iscsiInfo *iscsiDisk) *iscsiLib.Connector {
 	}
 	c := iscsiLib.Connector{
 		VolumeName:       iscsiInfo.VolName,
+		VolumeUUID:       iscsiInfo.volumeUUID,
 		TargetIqn:        iscsiInfo.Iqn,
 		TargetPortals:    iscsiInfo.Portals,
 		Lun:              iscsiInfo.lun,
@@ -157,12 +207,23 @@ func getISCSIDiskUnmounter(req *csi.NodeUnpublishVolumeRequest) *iscsiDiskUnmoun
 	}
 }
 
-func portalMounter(portal string) string {
+func validatePortal(portal string) (string, error) {
+	// The connector currently supports hostnames and IPv4, not IPv6.
+	if strings.ContainsAny(portal, " /\\\t\n\r*?[]") || strings.Count(portal, ":") > 1 {
+		return "", fmt.Errorf("invalid iSCSI portal %q", portal)
+	}
 	if !strings.Contains(portal, ":") {
 		portal += ":3260"
 	}
-
-	return portal
+	host, port, err := net.SplitHostPort(portal)
+	if err != nil || host == "" {
+		return "", fmt.Errorf("invalid iSCSI portal %q", portal)
+	}
+	n, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || n == 0 {
+		return "", fmt.Errorf("invalid iSCSI portal %q", portal)
+	}
+	return portal, nil
 }
 
 func parseSecret(secretParams string) map[string]string {
@@ -237,6 +298,7 @@ type iscsiDisk struct {
 	sessionSecret   iscsiLib.Secrets
 	discoverySecret iscsiLib.Secrets
 	InitiatorName   string
+	volumeUUID      string
 	VolName         string
 }
 

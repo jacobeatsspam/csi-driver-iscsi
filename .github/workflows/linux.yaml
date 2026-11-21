@@ -19,6 +19,9 @@ jobs:
           go-version-file: go.mod
         id: go
 
+      - name: Check Helm
+        run: helm version --short
+
       - name: Test and Verify
         run: make verify
 
@@ -27,8 +30,6 @@ jobs:
           GITHUB_ACTIONS: true
         run: |
           export PATH=$PATH:$HOME/.local/bin
-          make
-          echo "is running in github actions: $GITHUB_ACTIONS"
           make sanity-test
 
       - name: Install goveralls

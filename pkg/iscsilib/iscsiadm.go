@@ -158,9 +158,10 @@ func createCHAPEntries(baseArgs []string, secrets Secrets, discovery bool) error
 		}
 	}
 
-	_, err := iscsiCmd(args...)
+	// The ordinary iscsiadm logger includes command arguments and output.
+	_, err := execWithTimeout("iscsiadm", args, 3*time.Second)
 	if err != nil {
-		return fmt.Errorf("failed to update discoverydb with CHAP, err: %v", err)
+		return fmt.Errorf("failed to update iscsiadm CHAP credentials: %w", err)
 	}
 
 	return nil
@@ -178,8 +179,6 @@ func Login(tgtIQN, portal string) error {
 	klog.V(2).Infof("Begin Login...")
 	baseArgs := []string{"-m", "node", "-T", tgtIQN, "-p", portal}
 	if _, err := iscsiCmd(append(baseArgs, []string{"-l"}...)...); err != nil {
-		// delete the node record from database
-		_, _ = iscsiCmd(append(baseArgs, []string{"-o", "delete"}...)...)
 		return fmt.Errorf("failed to sendtargets to portal %s, err: %v", portal, err)
 	}
 	return nil

@@ -93,3 +93,46 @@ func btrfsDeviceInSysfs(rdev uint64, root string) (bool, error) {
 	}
 	return false, nil
 }
+
+func mountedTarget(targetPath, device string) (mount.MountPoint, error) {
+	var stat unix.Stat_t
+	if err := unix.Stat(device, &stat); err != nil {
+		return mount.MountPoint{}, fmt.Errorf("cannot inspect mounted device: %w", err)
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFBLK {
+		return mount.MountPoint{}, fmt.Errorf("mounted device is not a block device")
+	}
+	path, err := filepath.EvalSymlinks(targetPath)
+	if err != nil {
+		return mount.MountPoint{}, err
+	}
+	infos, err := mount.ParseMountInfo("/proc/self/mountinfo")
+	if err != nil {
+		return mount.MountPoint{}, fmt.Errorf("cannot inspect target mount: %w", err)
+	}
+	return findTargetMount(infos, path, stat.Rdev)
+}
+
+func findTargetMount(infos []mount.MountInfo, targetPath string, rdev uint64) (mount.MountPoint, error) {
+	var target mount.MountPoint
+	for _, info := range infos {
+		if info.MountPoint != targetPath {
+			continue
+		}
+		if target.Path != "" {
+			return mount.MountPoint{}, fmt.Errorf("target path has stacked mounts")
+		}
+		if uint32(info.Major) != unix.Major(rdev) || uint32(info.Minor) != unix.Minor(rdev) {
+			// Btrfs reports an anonymous mount number and names its backing device in Source.
+			var source unix.Stat_t
+			if info.FsType != "btrfs" || unix.Stat(info.Source, &source) != nil || source.Mode&unix.S_IFMT != unix.S_IFBLK || source.Rdev != rdev {
+				return mount.MountPoint{}, fmt.Errorf("target path is mounted from a different device")
+			}
+		}
+		target = mount.MountPoint{Path: targetPath, Type: info.FsType, Opts: info.MountOptions}
+	}
+	if target.Path == "" {
+		return mount.MountPoint{}, fmt.Errorf("target mount is missing")
+	}
+	return target, nil
+}

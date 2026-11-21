@@ -30,7 +30,7 @@ import (
 
 // ExecWithTimeout execute a command with a timeout and returns an error if timeout is exceeded
 func ExecWithTimeout(command string, args []string, timeout time.Duration) ([]byte, error) {
-	klog.V(2).Infof("Executing command '%v' with args: '%v'.\n", command, args)
+	klog.V(2).Infof("Executing %s", command)
 
 	// Create a new context and add a timeout to it
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)

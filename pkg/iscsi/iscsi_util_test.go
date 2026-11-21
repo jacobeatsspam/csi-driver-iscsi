@@ -18,6 +18,7 @@ package iscsi
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -74,7 +75,7 @@ func TestDetachDiskRetriesLogout(t *testing.T) {
 	dir := t.TempDir()
 	infoPath := filepath.Join(dir, "iscsi-volume.json")
 	connector := &iscsiLib.Connector{TargetIqn: "iqn.test:target", TargetPortals: []string{"127.0.0.1:3260"}, DevicesDetached: true}
-	if err := persistDetachedConnector(infoPath, connector); err != nil {
+	if err := connector.Persist(infoPath); err != nil {
 		t.Fatal(err)
 	}
 	fail := filepath.Join(dir, "fail")
@@ -260,35 +261,25 @@ func TestDetachDiskPersistsBeforeRemoval(t *testing.T) {
 	for _, failPersistence := range []bool{false, true} {
 		t.Run(fmt.Sprintf("persistence failure=%v", failPersistence), func(t *testing.T) {
 			dir := t.TempDir()
-			infoPath, snapshot, target := filepath.Join(dir, "iscsi-volume.json"), filepath.Join(dir, "snapshot"), filepath.Join(dir, "target")
+			infoPath, snapshot := filepath.Join(dir, "iscsi-volume.json"), filepath.Join(dir, "snapshot")
 			device := iscsiLib.Device{Name: "null", Type: "disk", Transport: "iscsi"}
-			connector := &iscsiLib.Connector{TargetIqn: "iqn.test:target", TargetPortals: []string{"192.0.2.1:3260"}, MountTargetDevice: &device, Devices: []iscsiLib.Device{device}}
-			if err := connector.Persist(infoPath); err != nil {
-				t.Fatal(err)
-			}
+			connector := &iscsiLib.Connector{MountTargetDevice: &device, Devices: []iscsiLib.Device{device}}
 			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 			t.Setenv("ISCSI_TEST_RECORD", infoPath)
 			t.Setenv("ISCSI_TEST_SNAPSHOT", snapshot)
-			for name, script := range map[string]string{
-				"lsblk":    "#!/bin/sh\necho 'null null  0:0:0:1 disk iscsi 1G'\n",
-				"blockdev": "#!/bin/sh\ncat \"$ISCSI_TEST_RECORD\" > \"$ISCSI_TEST_SNAPSHOT\"\nexit 1\n",
-			} {
-				if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0755); err != nil {
+			script := "#!/bin/sh\ncat \"$ISCSI_TEST_RECORD\" > \"$ISCSI_TEST_SNAPSHOT\"\necho injected-flush-failure\nexit 1\n"
+			if err := os.WriteFile(filepath.Join(dir, "blockdev"), []byte(script), 0755); err != nil {
+				t.Fatal(err)
+			}
+			wantError := "injected-flush-failure"
+			if failPersistence {
+				if err := os.Mkdir(infoPath, 0700); err != nil {
 					t.Fatal(err)
 				}
+				wantError = "replace iSCSI persistence file"
 			}
-			mounter := mount.NewFakeMounter([]mount.MountPoint{{Device: "/dev/null", Path: target}})
-			if failPersistence {
-				mounter.UnmountFunc = func(string) error {
-					if err := os.Rename(infoPath, infoPath+".saved"); err != nil {
-						return err
-					}
-					return os.Mkdir(infoPath, 0700)
-				}
-			}
-			c := iscsiDiskUnmounter{iscsiDisk: &iscsiDisk{VolName: "volume"}, mounter: mounter}
-			if err := detachDisk(c, target, infoPath); err == nil {
-				t.Fatal("injected failure was ignored")
+			if err := removeVolumeDevices(connector, infoPath); err == nil || !strings.Contains(err.Error(), wantError) {
+				t.Fatalf("removeVolumeDevices() error = %v, want %q", err, wantError)
 			}
 			data, err := os.ReadFile(snapshot)
 			if failPersistence {
@@ -390,7 +381,7 @@ func TestDetachDiskPreservesSharedPortal(t *testing.T) {
 	dir := t.TempDir()
 	infoPath := filepath.Join(dir, "iscsi-volume.json")
 	connector := &iscsiLib.Connector{TargetIqn: "iqn.test:target", TargetPortals: []string{"one:3260", "two:3260"}, DevicesDetached: true}
-	if err := persistDetachedConnector(infoPath, connector); err != nil {
+	if err := connector.Persist(infoPath); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "iscsi-other.json"), []byte(`{"target_iqn":"iqn.test:target","target_portal":["two:3260"]}`), 0600); err != nil {
@@ -420,7 +411,7 @@ func TestDetachDiskResumesPortalLogouts(t *testing.T) {
 	dir := t.TempDir()
 	infoPath := filepath.Join(dir, "iscsi-volume.json")
 	connector := &iscsiLib.Connector{TargetIqn: "iqn.test:target", TargetPortals: []string{"127.0.0.1:3260", "127.0.0.2:3260"}, DevicesDetached: true}
-	if err := persistDetachedConnector(infoPath, connector); err != nil {
+	if err := connector.Persist(infoPath); err != nil {
 		t.Fatal(err)
 	}
 	log, fail := filepath.Join(dir, "commands"), filepath.Join(dir, "fail")
@@ -477,5 +468,229 @@ func TestUnsharedPortals(t *testing.T) {
 	}
 	if _, _, err := unsharedPortals(current, connector); err == nil {
 		t.Fatal("invalid connection record was accepted")
+	}
+}
+
+func TestFinishDetachRetainsOtherConnections(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "mount")
+	current := filepath.Join(dir, "iscsi-a.json")
+	other := filepath.Join(dir, "iscsi-b.json")
+	if err := os.Mkdir(target, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range []string{current, other} {
+		if err := os.WriteFile(file, []byte("connection"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := finishDetach(target, current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(current); !os.IsNotExist(err) {
+		t.Fatalf("connection record remains: %v", err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("mount path remains: %v", err)
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Fatalf("other connection changed: %v", err)
+	}
+}
+
+func TestTargetdDetachRequiresDeviceIdentity(t *testing.T) {
+	dir := t.TempDir()
+	infoPath := filepath.Join(dir, "iscsi-volume.json")
+	id := "td1_backend_pool_csitd_namespace_request_policy_volume-uuid"
+	connector := &iscsiLib.Connector{VolumeName: id, TargetIqn: "iqn.test:target", TargetPortals: []string{"127.0.0.1:3260"}, VolumeUUID: "volume-uuid", DevicesDetached: true}
+	if err := connector.Persist(infoPath); err != nil {
+		t.Fatal(err)
+	}
+	c := iscsiDiskUnmounter{iscsiDisk: &iscsiDisk{VolName: id}, mounter: mount.NewFakeMounter(nil)}
+	if err := detachDisk(c, filepath.Join(dir, "missing"), infoPath); err == nil {
+		t.Fatal("targetd detach accepted an unverifiable device")
+	}
+	if _, err := os.Stat(infoPath); err != nil {
+		t.Fatalf("connection record was lost: %v", err)
+	}
+	connector.VolumeUUID = ""
+	if err := connector.Persist(infoPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := detachDisk(c, filepath.Join(dir, "missing"), infoPath); err == nil || !strings.Contains(err.Error(), "connection record do not match") {
+		t.Fatalf("dynamic record without UUID was accepted: %v", err)
+	}
+}
+
+func TestValidateAttachedDevices(t *testing.T) {
+	root := t.TempDir()
+	byPath := filepath.Join(root, "disk", "by-path")
+	if err := os.MkdirAll(byPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	device := filepath.Join(root, "sda")
+	if err := os.WriteFile(device, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(byPath, "ip-10.0.0.1:3260-iscsi-iqn.test-lun-4")
+	if err := os.Symlink(device, link); err != nil {
+		t.Fatal(err)
+	}
+	connector := &iscsiLib.Connector{TargetIqn: "iqn.test", TargetPortals: []string{"10.0.0.1:3260"}, Lun: 4, Devices: []iscsiLib.Device{{Name: "sda"}}, MountTargetDevice: &iscsiLib.Device{Name: "sda"}}
+	if err := validateAttachedDevices(connector, root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "sdb"), link); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateAttachedDevices(connector, root); err == nil || errors.Is(err, errDevicesGone) {
+		t.Fatalf("accepted a device that no longer belongs to the target and LUN: %v", err)
+	}
+	if err := os.Remove(device); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateAttachedDevices(connector, root); !errors.Is(err, errDevicesGone) {
+		t.Fatalf("expected missing-device recovery, got %v", err)
+	}
+}
+
+func TestDeviceMountedRecognizesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	device := filepath.Join(dir, "device")
+	alias := filepath.Join(dir, "alias")
+	if err := os.WriteFile(device, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(device, alias); err != nil {
+		t.Fatal(err)
+	}
+	mounter := mount.NewFakeMounter([]mount.MountPoint{{Device: alias, Path: "/other"}})
+	mounted, err := deviceMounted(mounter, device)
+	if err != nil || !mounted {
+		t.Fatalf("aliased mount not detected: %v, %v", mounted, err)
+	}
+}
+
+func TestVerifyVolumeSerial(t *testing.T) {
+	devices := []iscsiLib.Device{{Name: "sda"}, {Name: "sdb"}}
+	read := func(device iscsiLib.Device) (string, error) { return "volume-uuid", nil }
+	if err := verifyVolumeSerial(devices, "volume-uuid", read); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyVolumeSerial(devices, "other-uuid", read); err == nil {
+		t.Fatal("accepted different volume UUID")
+	}
+	if err := verifyVolumeSerial(nil, "volume-uuid", read); err == nil {
+		t.Fatal("accepted empty device list")
+	}
+	if err := verifyVolumeSerial(devices, "volume-uuid", func(iscsiLib.Device) (string, error) { return "", errors.New("unavailable") }); err == nil {
+		t.Fatal("accepted unreadable serial")
+	}
+}
+
+func TestFinishDetachDoesNotRemoveDirectoryContents(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "mount")
+	if err := os.Mkdir(target, 0700); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(target, "preserve")
+	if err := os.WriteFile(file, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	record := filepath.Join(dir, "connection")
+	if err := os.WriteFile(record, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := finishDetach(target, record); err == nil {
+		t.Fatal("removed nonempty target directory")
+	}
+	if _, err := os.Stat(file); err != nil {
+		t.Fatalf("target contents lost: %v", err)
+	}
+	if _, err := os.Stat(record); err != nil {
+		t.Fatalf("connection record lost: %v", err)
+	}
+}
+
+func TestSameConnectorTarget(t *testing.T) {
+	a := &iscsiLib.Connector{VolumeName: "vol", TargetIqn: "iqn.test", TargetPortals: []string{"a:3260", "b:3260"}, Lun: 1, VolumeUUID: "uuid"}
+	b := &iscsiLib.Connector{VolumeName: "vol", TargetIqn: "iqn.test", TargetPortals: []string{"b:3260", "a:3260"}, Lun: 1, VolumeUUID: "uuid", Interface: "default"}
+	if !sameConnectorTarget(a, b) {
+		t.Fatal("equivalent connection rejected")
+	}
+	b.Lun = 2
+	if sameConnectorTarget(a, b) {
+		t.Fatal("different LUN accepted")
+	}
+	b.Lun, b.VolumeUUID = 1, "different"
+	if sameConnectorTarget(a, b) {
+		t.Fatal("replacement volume accepted")
+	}
+}
+
+func TestReadDeviceSerialTracksCurrentSCSIDevice(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "sda", "device")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "vpd_pg80")
+	write := func(serial string) {
+		t.Helper()
+		page := append([]byte{0, 0x80, byte(len(serial) >> 8), byte(len(serial))}, []byte(serial)...)
+		if err := os.WriteFile(path, page, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(" old-uuid ")
+	got, err := readDeviceSerial(root, "sda")
+	if err != nil || got != "old-uuid" {
+		t.Fatalf("old serial = %q, %v", got, err)
+	}
+	for _, serial := range []string{"new-uuid", "new-uuid\x00", "  new-uuid\x00 \x00\t"} {
+		write(serial)
+		got, err = readDeviceSerial(root, "sda")
+		if err != nil || got != "new-uuid" {
+			t.Fatalf("reused device serial %q = %q, %v", serial, got, err)
+		}
+	}
+	for _, serial := range []string{"\x00new-uuid", "new\x00-uuid", "new-uuid\x00garbage", "new-uuid!", "\x00 \x00"} {
+		write(serial)
+		if _, err := readDeviceSerial(root, "sda"); err == nil {
+			t.Fatalf("accepted invalid serial %q", serial)
+		}
+	}
+	for _, page := range [][]byte{{}, {0, 0x83, 0, 1, 'x'}, {0, 0x80, 0, 2, 'x'}} {
+		if err := os.WriteFile(path, page, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readDeviceSerial(root, "sda"); err == nil {
+			t.Fatalf("accepted malformed page %v", page)
+		}
+	}
+	if _, err := readDeviceSerial(root, "../sda"); err == nil {
+		t.Fatal("accepted unsafe device name")
+	}
+}
+
+func TestEffectiveMountOptions(t *testing.T) {
+	for _, tc := range []struct {
+		requestRO bool
+		flags     []string
+		want      []string
+	}{
+		{true, []string{"rw,nosuid"}, []string{"nosuid", "ro"}},
+		{false, []string{"noatime,ro"}, []string{"noatime", "ro"}},
+		{false, []string{"ro", "rw", "nodev"}, []string{"nodev", "rw"}},
+	} {
+		disk := iscsiDiskMounter{readOnly: tc.requestRO, mountOptions: tc.flags}
+		flags, ro := disk.effectiveMountOptions()
+		if !reflect.DeepEqual(flags, tc.want) || ro != (tc.want[len(tc.want)-1] == "ro") {
+			t.Errorf("mount flags %v readonly %v: got %v, %v", tc.flags, tc.requestRO, flags, ro)
+		}
 	}
 }

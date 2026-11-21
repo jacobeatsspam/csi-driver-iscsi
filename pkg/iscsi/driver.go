@@ -25,12 +25,14 @@ import (
 )
 
 type driver struct {
-	name     string
-	nodeID   string
-	version  string
-	endpoint string
-	cap      []*csi.VolumeCapability_AccessMode
-	cscap    []*csi.ControllerServiceCapability
+	name        string
+	nodeID      string
+	version     string
+	endpoint    string
+	cap         []*csi.VolumeCapability_AccessMode
+	cscap       []*csi.ControllerServiceCapability
+	targetd     *targetdController
+	dynamicNode bool
 }
 
 const (
@@ -69,6 +71,16 @@ func NewNodeServer(d *driver) *nodeServer {
 
 func (d *driver) Run() {
 	s := NewNonBlockingGRPCServer()
+	if d.targetd != nil {
+		s.Start(d.endpoint, NewDefaultIdentityServer(d), NewControllerServer(d), nil)
+		s.Wait()
+		return
+	}
+	if d.dynamicNode {
+		s.Start(d.endpoint, NewDefaultIdentityServer(d), nil, NewNodeServer(d))
+		s.Wait()
+		return
+	}
 	s.Start(d.endpoint,
 		NewDefaultIdentityServer(d),
 		// iSCSI plugin has not implemented ControllerServer
@@ -77,6 +89,9 @@ func (d *driver) Run() {
 		NewNodeServer(d))
 	s.Wait()
 }
+
+// EnableTargetdNode enables automatic initiator identity reporting on nodes.
+func (d *driver) EnableTargetdNode() { d.dynamicNode = true }
 
 func (d *driver) AddVolumeCapabilityAccessModes(vc []csi.VolumeCapability_AccessMode_Mode) []*csi.VolumeCapability_AccessMode {
 	var vca []*csi.VolumeCapability_AccessMode

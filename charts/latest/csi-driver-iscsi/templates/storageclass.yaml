@@ -1,0 +1,19 @@
+{{- if .Values.storageClass.create }}
+{{- if not .Values.targetd.enabled }}
+{{- fail "storageClass.create requires targetd.enabled" }}
+{{- end }}
+{{- $pool := required "storageClass.pool is required" .Values.storageClass.pool }}
+{{- if not (has $pool .Values.targetd.pools) }}
+{{- fail "storageClass.pool must be in targetd.pools" }}
+{{- end }}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ required "storageClass.name is required" .Values.storageClass.name | quote }}
+provisioner: iscsi.csi.k8s.io
+parameters:
+  pool: {{ $pool | quote }}
+reclaimPolicy: {{ .Values.storageClass.reclaimPolicy }}
+volumeBindingMode: {{ .Values.storageClass.volumeBindingMode }}
+allowVolumeExpansion: false
+{{- end }}
