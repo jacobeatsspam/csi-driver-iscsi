@@ -1,0 +1,70 @@
+---
+name: Targetd test image
+
+on:
+  push:
+    branches: [targetd]
+
+permissions:
+  contents: read
+
+jobs:
+  storage-tests:
+    if: github.repository == 'jacobeatsspam/csi-driver-iscsi'
+    uses: ./.github/workflows/ubuntu-e2e.yml
+
+  publish:
+    needs: storage-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/jacobeatsspam/csi-driver-iscsi
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Build Linux binaries
+        run: |
+          make iscsi ARCH=amd64
+          make iscsi ARCH=arm64
+      - name: Publish multiarch image
+        id: image
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DOCKER_CONFIG="$RUNNER_TEMP/fork-docker"
+          mkdir -p "$DOCKER_CONFIG"
+          trap 'docker logout ghcr.io >/dev/null 2>&1; rm -rf "$DOCKER_CONFIG"' EXIT
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          docker buildx create --use --name fork-builder
+          # The Dockerfile installs target-architecture packages. Build natively
+          # on amd64 and register emulation for the arm64 image.
+          docker run --privileged --rm tonistiigi/binfmt:qemu-v9.2.0 --install arm64
+          for arch in amd64 arm64; do
+            docker buildx build --pull --push --platform "linux/$arch" \
+              --build-arg "ARCH=$arch" \
+              --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+              --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+              --tag "$IMAGE:sha-$GITHUB_SHA-$arch" .
+          done
+          docker buildx imagetools create --tag "$IMAGE:sha-$GITHUB_SHA" \
+            "$IMAGE:sha-$GITHUB_SHA-amd64" "$IMAGE:sha-$GITHUB_SHA-arm64"
+          digest=$(docker buildx imagetools inspect "$IMAGE:sha-$GITHUB_SHA" \
+            --format '{{json .Manifest}}' | jq -r .digest)
+          test -n "$digest" && test "$digest" != null
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          {
+            echo '### Fork image'
+            printf '\nSource: %s\n\nDeploy: %s@%s\n' "$GITHUB_SHA" "$IMAGE" "$digest"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"

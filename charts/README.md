@@ -11,6 +11,12 @@ chart uses the same driver image on the controller and nodes. Each sidecar
 image has its own repository, tag, and pull policy under `image`.
 To pin an image by digest, include the digest in its repository value.
 
+For the `targetd` trial on `jacobeatsspam/csi-driver-iscsi`, each branch push
+runs the storage E2E tests. After they pass, the **Targetd test image** workflow
+publishes Linux amd64 and arm64 images. Copy the full
+`ghcr.io/jacobeatsspam/csi-driver-iscsi@sha256:...` reference from the workflow
+summary into `image.iscsi.repository`. Install the chart from that commit.
+
 For targetd, create a Secret in the release namespace with a `password` key.
 Set `targetd.existingSecret` to its name. Do not put the password in Helm values.
 The controller reads the password at startup. Restart it after changing the
